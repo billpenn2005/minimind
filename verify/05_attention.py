@@ -41,8 +41,9 @@ def check_shapes(args):
     x = torch.randn(2, 5, 2, 24)
     out = repeat_kv(x, 2)
     assert out.shape == (2, 5, 4, 24)
-    assert torch.allclose(out[:, :, 0], x[:, :, 0]) and torch.allclose(out[:, :, 1], x[:, :, 1])
-    assert torch.allclose(out[:, :, 2], x[:, :, 0]) and torch.allclose(out[:, :, 3], x[:, :, 1])
+    # expand->reshape 的展开序：同一 KV 头相邻重复 [kv0, kv0, kv1, kv1]
+    assert torch.allclose(out[:, :, 0], x[:, :, 0]) and torch.allclose(out[:, :, 1], x[:, :, 0])
+    assert torch.allclose(out[:, :, 2], x[:, :, 1]) and torch.allclose(out[:, :, 3], x[:, :, 1])
     assert repeat_kv(x, 1) is x
 
 
@@ -51,7 +52,7 @@ def check_causal(args):
     cfg = MiniMindConfig(**TINY_CONFIG)
     attn = Attention(cfg)
     cos, sin = precompute_freqs_cis(cfg.head_dim, end=cfg.max_position_embeddings, rope_base=cfg.rope_theta)
-    x = torch.randn(1, 6, cfg.hidden_size)
+    x = torch.randn(1, 6, cfg.hidden_size, requires_grad=True)
     # 前向在图内：取第 0 个位置的输出
     out, _ = attn(x, (cos[:6], sin[:6]))
     target = out[0, 0].sum()
@@ -72,11 +73,13 @@ def check_reference(args):
     x = torch.randn(2, 5, cfg.hidden_size)
     out, _ = attn(x, (cos[:5], sin[:5]))
 
-    # 手写参考：全量点积注意力
+    # 手写参考：全量点积注意力（注意 q_norm/k_norm 在拆分后作用在每头向量上）
     with torch.no_grad():
-        xq = attn.q_norm(attn.q_proj(x)).view(2, 5, cfg.num_attention_heads, cfg.head_dim)
-        xk = attn.k_norm(attn.k_proj(x)).view(2, 5, cfg.num_key_value_heads, cfg.head_dim)
+        xq = attn.q_proj(x).view(2, 5, cfg.num_attention_heads, cfg.head_dim)
+        xk = attn.k_proj(x).view(2, 5, cfg.num_key_value_heads, cfg.head_dim)
         xv = attn.v_proj(x).view(2, 5, cfg.num_key_value_heads, cfg.head_dim)
+        xq = attn.q_norm(xq)
+        xk = attn.k_norm(xk)
 
     # 用公式直接旋转
     def rotate_half(t):

@@ -21,10 +21,11 @@ class MiniMindConfig(PretrainedConfig):
         self.num_hidden_layers = kwargs.get("num_hidden_layers", 8)       # 层数
         self.dropout = kwargs.get("dropout", 0.0)
 
-        # ---- 词表与特殊 token ----
+        # ---- 词表与特殊 token ----------------
         self.vocab_size = kwargs.get("vocab_size", 6400)
-        self.bos_token_id = kwargs.get("bos_token_id", 1)
-        self.eos_token_id = kwargs.get("eos_token_id", 2)
+        # 用 pop：既取值又移出 kwargs，避免传给 super 时与显式命名参数冲突
+        self.bos_token_id = kwargs.pop("bos_token_id", 1)
+        self.eos_token_id = kwargs.pop("eos_token_id", 2)
 
         # ---- 注意力 ----
         self.flash_attn = kwargs.get("flash_attn", True)                  # 是否走 SDPA 快路径
@@ -73,11 +74,7 @@ class MiniMindConfig(PretrainedConfig):
 
         # 注意：transformers 新版本将 bos/eos 等 token id 作为 PretrainedConfig.__init__
         # 的显式命名参数处理（默认 None），必须显式传递，否则会被覆盖为 None。
-        super().__init__(
-            bos_token_id=self.bos_token_id,
-            eos_token_id=self.eos_token_id,
-            **kwargs,
-        )
+        super().__init__(bos_token_id=self.bos_token_id, eos_token_id=self.eos_token_id, **kwargs)
 
     # ---------------------------------------------------------------- 参数估算
     def estimate_parameter_count(self) -> int:

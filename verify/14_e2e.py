@@ -41,30 +41,31 @@ def check_e2e(args):
     assert (REPO_ROOT / "minimind3-hf").exists() or (REPO_ROOT / "out/e2e/hf_128").exists(), "缺 HF 产物"
 
 
-@register("14.2 全链验收脚本就位、分支数正确、bash 语法无误")
+@register("14.2 单分支自洽：参考答案就位、起点留白、按课过滤可用")
 def check_chain(args):
-    sh = REPO_ROOT / "tools" / "check_all_branches.sh"
-    assert sh.exists(), "缺 tools/check_all_branches.sh"
-    r = subprocess.run(["bash", "-n", str(sh)], capture_output=True, text=True)
-    assert r.returncode == 0, f"bash 语法错误: {r.stderr}"
-    branches = subprocess.run(
-        ["git", "for-each-ref", "--format=%(refname:short)", "refs/heads/tutorial/"],
-        capture_output=True, text=True,
+    # 参考答案存在（完整实现 + 规范数据）
+    assert (REPO_ROOT / "answers/minimind3/__init__.py").exists()
+    assert (REPO_ROOT / "answers/data/tiny_pretrain.jsonl").exists()
+    assert (REPO_ROOT / "answers/data/tiny_sft.jsonl").exists()
+    # 全链验收脚本在单分支模式下已移除（由 verify.py 按课过滤替代）
+    assert not (REPO_ROOT / "tools/check_all_branches.sh").exists()
+    # 按课过滤可运行：verify.py 03 只执行第 01~03 课的检查（跳过 04+ 模块）
+    r = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "verify.py"), "03", "--fast"],
+        capture_output=True, text=True, cwd=str(REPO_ROOT), timeout=600,
     )
-    names = sorted(b for b in branches.stdout.splitlines() if b.strip())
-    assert len(names) == 14, f"教程分支应 14 个，实际 {len(names)}: {names}"
-    # 分支链拓扑：每课是前一课的子提交（孤儿分支 01 除外）
-    assert names[-1] == "tutorial/14-final"
+    out = r.stdout
+    assert "第 01~03 课" in out, f"过滤器作用域声明缺失:\n{out[-300:]}"
+    assert "跳过 11 个后续检查模块" in out, f"未跳过 04+ 模块:\n{out[-300:]}"
+    assert "04." not in out and "14." not in out, "过滤器仍执行了后续课程检查"
+    # 01.x（按课留白）在毕业态属预期失败（工作区已含全部文件），不要求 0 failed
 
 
-@register("14.3 检查模块完整性（已到课的检查文件均非空，且到期全量足够）")
+@register("14.3 检查模块完整性（全部 14 课检查模块非空且总量足够）")
 def check_scale(args):
     root = Path(__file__).resolve().parent.parent
     files = sorted((root / "verify").glob("[0-9]*.py"))
     assert files, "无检查模块"
-    # 课程检查文件（本模块 14_e2e 是“全局护栏”，不计入课程进度）
-    lesson_files = [f for f in files if not f.stem.startswith("14")]
-    assert lesson_files, "无课程检查模块"
     total = 0
     for m in files:
         import importlib
@@ -72,8 +73,6 @@ def check_scale(args):
         mod = importlib.import_module(f"verify.{m.stem}")
         assert mod.CHECKS, f"{m.stem} 为空模块"
         total += len(mod.CHECKS)
-    # 逐课递进的检查数下限（01..13 课程文件 + 14 全局文件总量）
-    floors = {1: 5, 2: 10, 3: 15, 4: 21, 5: 27, 6: 32, 7: 37, 8: 42, 9: 50, 10: 55, 11: 59, 12: 62, 13: 67}
-    lesson = len(lesson_files)
-    floor = (floors.get(lesson, 67)) + (3 if lesson == 13 else 0)  # 13 门课时含 14_e2e 的 3 项
-    assert total >= floor, f"检查项数量异常: {total} < {floor}"
+    # 课程锚点：14 门课累计至少 70 项（01..13 课 67 项 + 本模块 3 项）
+    assert len(files) >= 14, f"检查模块数不足: {len(files)}"
+    assert total >= 70, f"检查项数量异常: {total} < 70"

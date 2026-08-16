@@ -8,3 +8,4 @@ minimind3-hf/
 *.pth
 *.safetensors
 dataset/*.jsonl
+/data/

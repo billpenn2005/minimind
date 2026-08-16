@@ -1,132 +1,90 @@
-# 第 07 课 · 残差块 MiniMindBlock（Pre-Norm）
+# 第 07 课 · Pre-Norm 残差块 MiniMindBlock
 
-> 难度：★★☆☆☆ ｜ 预计用时：1~2 小时 ｜ 前置：05+06 课（注意力与前馈）
-> 学完本课你应能回答：**残差连接解决什么问题？为什么现在都用 Pre-Norm 而不是 Post-Norm？"梯度高速公路"是什么？**
-
----
+> [上一课 06-feedforward](../06-feedforward/README.md) ← [目录](../../README.md) → [下一课 08-model](../08-model/README.md)
+>
+> 难度：★★☆☆☆ ｜ 预计用时 1 小时 ｜ 前置：05+06 课
 
 ## 0. 本课目标
 
-- [ ] 理解残差连接（Residual Connection）的动机；
-- [ ] 对比 Post-Norm 与 Pre-Norm，理解当代 LLM 的选择；
+- [ ] 理解残差连接（梯度高速公路）与 Pre-Norm vs Post-Norm；
 - [ ] 手写 `minimind3/block.py` 的 `MiniMindBlock`（含 KV 透传约定）；
-- [ ] 验收 5 项新检查（07.1~07.5，累计 37 项全过）。
+- [ ] 验收 38 项累计（本课新增 07.1~07.5）。
 
----
+## 1. 理论速览
 
-## 1. 理论
+- **深层诅咒**：梯度逐层连乘 $\frac{\partial L}{\partial x_0} = \prod_l \frac{\partial x_{l+1}}{\partial x_l}$，深层梯度消失/爆炸。
+- **残差**：$x_{l+1} = x_l + f(x_l)$ → 偏导 $\frac{\partial x_{l+1}}{\partial x_l} = 1 + \frac{\partial f}{\partial x_l}$——那个 `+1` 是"高速公路"，即使 $\partial f$ 极小，梯度也能直通底层。
+- **Pre-Norm vs Post-Norm**：Post（2017 原始）先算子层再归一化，训练挑剔；Pre（当代标配）入口归一化 `x + Attn(Norm(x))`，天然稳定，ResNet/LLM 同源。
+- **双子结构**：注意力与 MLP 各配一个 Norm，各配一条残差。
+- **命名约定**：`input_layernorm` / `post_attention_layernorm` 是 transformers/Llama/Qwen 生态通用命名——第 13 课权重转换靠 state_dict 键名对上。
+- **KV 透传**：块接收 `past_key_value`、返回 `present_kv`（`use_cache=False` 时 None），把多块缓存编排留给主体（第 08 课）。
 
-### 1.1 深层的诅咒：梯度消失
+## 2. 任务要求（精确规格）
 
-网络越深越好（表达力强），但反向传播时梯度要**逐层相乘**一路传回去：
-$\partial L / \partial x_0 = \partial L / \partial x_L \cdot \prod_{l} W_l$。层数一多（哪怕 8 层），
-连乘会让梯度指数级缩水或爆炸——浅层学不动了。
+### 2.1 新建 `minimind3/block.py`
 
-### 1.2 残差连接的魔法：给梯度一条"高速公路"
+**模块级 import**：`from torch import nn`；`from .attention import Attention`、`from .config import MiniMindConfig`、`from .feed_forward import FeedForward`、`from .rms_norm import RMSNorm`。
 
-残差连接让每一层学习"**增量**"而不是"完整变换"：
+### 2.2 `class MiniMindBlock(nn.Module)`
 
-$$
-x_{l+1} = x_l + f(x_l)
-$$
+**`__init__(self, layer_id: int, config: MiniMindConfig)`**：
 
-其中 $f$ 是层内计算（Attention 或 FFN + Norm）。反向传播时，输出对输入的偏导是：
-
-$$
-\frac{\partial x_{l+1}}{\partial x_l} = 1 + \frac{\partial f(x_l)}{\partial x_l}
-$$
-
-那个 **`+1`** 就是"高速公路"：即使深层把 $\partial f$ 压到极小，梯度也能**恒等直通**到最底层。
-于是 100 层也敢训。这是 ResNet（2015，CV）和现代 Transformer 共同的基石。
-
-### 1.3 Pre-Norm vs Post-Norm
-
-| | 顺序 | 决策 |
+| 属性 | 类型 | 值 |
 |---|---|---|
-| **Post-Norm**（2017 原始 Transformer） | `x + Attention(Norm(x))` 之后才 Norm | 对归一化时机更挑剔，深模型训练不稳 |
-| **Pre-Norm**（当代标配） | `x + Attention(Norm(x))`，**入口归一化** | 训练稳定，天然支持"梯度直通" |
+| `layer_id` | `int` | 构造参数 1（调试/未来 MoE 用） |
+| `self_attn` | `Attention` | `Attention(config)` |
+| `input_layernorm` | `RMSNorm` | `RMSNorm(config.hidden_size, eps=config.rms_norm_eps)` |
+| `post_attention_layernorm` | `RMSNorm` | 同上 |
+| `mlp` | `FeedForward` | `FeedForward(config)` |
 
-我们的块是 Pre-Norm，且是**双子 Pre-Norm**（注意力、前馈各有一个 Norm）：
+**`forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None) -> tuple`**：
 
-```python
-class MiniMindBlock(nn.Module):
-    def __init__(self, config, layer_id):
-        self.layer_id = layer_id
-        self.self_attn = Attention(config, layer_idx=layer_id)   # 命名与 minimind 完全一致（13 课转换要靠它）
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = FeedForward(config)
-
-    def forward(self, hidden_states, attention_mask, past_key_value=None, use_cache=False, output_attentions=False):
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)          # 1. 归一化
-        attn_out, present_kv = self.self_attn(hidden_states, ...)    # 2. 注意力
-        hidden_states = residual + attn_out                          # 3. 残差直通
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states) # 4. 再归一化
-        hidden_states = self.mlp(hidden_states)                      # 5. 前馈
-        hidden_states = residual + hidden_states                     # 6. 再残差
-        return hidden_states, present_kv
-```
-
-注意命名 `input_layernorm` / `post_attention_layernorm` 是 **transformers 生态的通用约定**
-（Llama/Qwen 都叫这个），minimind 也不例外——13 课转换权重时 state_dict 键名要对上。
-
-### 1.4 KV 透传：块级接口约定
-
-`forward` 接受 `past_key_value` 并返回 `present_kv`；`use_cache=False` 时返回 None。
-这一层"透传"让 08 课的主体模型可以统一编排多层缓存（每层各存各的 K/V）。
-
----
-
-## 2. 手写任务清单
-
-1. `__init__(config, layer_id)`：两个 RMSNorm、一个 Attention、一个 FeedForward（顺序、命名如上）；
-2. `forward`：实现 Pre-Norm 残差两步（attn 一步 + mlp 一步）；
-3. 透传 `past_key_value` / `present_kv`；
-4. 保持与 minimind 的 state_dict 命名一致；
-5. 验收。
-
-```bash
-.venv/Scripts/python.exe verify.py
-```
-
-## 3. 验收解读（verify/07_block.py）
-
-| 检查 | 验什么 | 直觉 |
+| 参数 | 类型 | 默认 |
 |---|---|---|
-| 07.1 | 输出形状正确；子模块命名符合 minimind 约定 | 结构 + 将来的权重转换 |
-| 07.2 | **残差恒等**：把所有参数清零后 `block(x) == x`（1e-6） | 参数=0 时 f(x)=0，只有残差直通——最优雅的残差验证 |
-| 07.3 | 手写等价式 `x + attn(ln1(x)) + mlp(ln2(residual))` 一致（1e-5） | Pre-Norm 展开合法 |
-| 07.4 | 梯度同时流过注意力和 MLP 两个分支 | 残差不是"短路"了学习 |
-| 07.5 | `use_cache=False` 时 present_kv 为 None，反之有值 | KV 透传约定 |
+| `hidden_states` | `torch.Tensor (B,S,hidden)` | — |
+| `position_embeddings` | `tuple` | — |
+| `past_key_value` | `tuple \| None` | `None` |
+| `use_cache` | `bool` | `False` |
+| `attention_mask` | `torch.Tensor \| None` | `None` |
 
-> 07.2 是本节最漂亮的检查：如果实现里残差写错了（比如忘了加 x），参数清零后输出就是 0 而非 x，
-> 断言立刻现形。数学与代码在此缝合成一个"行为指纹"。
+返回 `(hidden_states, present_key_value)`：前者 `(B,S,hidden)`，后者为 K/V 元组或 `None`。
 
-## 4. 对照标准实现
+**主体四步（顺序固定）**：
+1. `residual = hidden_states`；
+2. `hidden_states, present_key_value = self.self_attn(self.input_layernorm(hidden_states), position_embeddings, past_key_value, use_cache, attention_mask)`；
+3. `hidden_states = hidden_states + residual`；
+4. `hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))`；return 二者。
 
-| minimind3 | minimind 标准实现 |
+## 3. 手写步骤
+
+实现 §2.2 → `.venv/Scripts/python.exe verify.py 07`。
+
+## 4. 验收解读（verify/07_block.py）
+
+| 检查（新） | 验什么 |
 |---|---|
-| `minimind3/block.py` → `MiniMindBlock` | `model/model_minimind.py` → `MiniMindBlock` |
+| 07.1 | 输出形状、子模块命名（`self_attn/input_layernorm/post_attention_layernorm/mlp`）——13 课转换的键名保证 |
+| 07.2 | **残差恒等**：全部参数清零 → `block(x) == x`（1e-6）：f(x)=0 只剩直通，最优雅的残差证明 |
+| 07.3 | 手写展开 `x + attn(ln1(x)) + mlp(ln2(residual))` 与块输出一致（1e-5） |
+| 07.4 | 梯度同时流经注意力和 MLP 两个分支 |
+| 07.5 | `use_cache=False` 返回的 `present_kv is None`；反之有值 |
 
-结构逐行对齐；minimind 的 MoE 分支（`mlp.aux_loss`）以扩展形式保留在本课接口里（07.5 之后的 08 课
-会把 `aux_loss` 汇总进输出），Dense 路径完全等价。
+## 5. 参考答案
 
-## 5. 常见坑
+`answers/minimind3/block.py`（先写后对；命名必须逐字符一致）。
 
-- **Post-Norm 写反**：输出质量与训练稳定性都下降，且验收 07.3 的展开式不匹配；
-- **忘了残差直通**：07.2 立刻红叉；
-- **`layer_id` 未传**：attention 里 `layer_idx` 用于调试/未来 MoE，缺失会在怪异的地方报错；
-- **`output_attentions` 参数缺位**：第 09 课 GenerationMixin 或调试工具会需要它（保持接口完整）。
+## 6. 常见坑
 
-## 6. 小结 & 下一课
+- **Post-Norm 写反**：07.3 的展开式不匹配；
+- **忘残差 `+`**：07.2（清参恒等）立刻红叉；
+- **忘传 `layer_id`**：behavior 可能仍过，但 13 课逐层转换需要它；
+- **返回顺序反**：`(hidden, kv)` 别写成 `(kv, hidden)`。
 
-- ✅ 残差 = 学习增量 + 梯度高速公路（`1 + ∂f` 直通）；
-- ✅ Pre-Norm = 入口归一化，训练稳定；
-- ✅ 子模块命名对齐生态（transformers 约定），为 13 课奠基；
-- ✅ KV 透传把缓存编排留给主体模型。
+## 7. 对照标准实现
 
-**下一课（08-model）**：把 8 个这样的块 + Embedding 表 + 最终 RMSNorm + RoPE buffer 组装成
-**完整主体模型 `MiniMindModel`**。你会学到 embedding 表、`persistent=False` 的 buffer 技巧，
-以及 KV-Cache 的"编排层"如何统筹所有层。
+`answers/minimind3/block.py` 与 minimind `MiniMindBlock` 等价；minimind 的 MoE 分支以 `mlp.aux_loss` 字段形式预留（第 08 课汇总）。
+
+## 8. 小结
+
+✅ 残差壳完成：Pre-Norm、双子结构、生态命名、KV 透传。
+**下一课**：把 N 个块 + Embedding + 终归一化 + RoPE 表装成完整主体 `MiniMindModel`。

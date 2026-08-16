@@ -1,137 +1,97 @@
-# 第 13 课 · HF transformers 格式转换（convert.py）
+# 第 13 课 · pth ⇄ HF transformers 格式转换
 
-> 难度：★★★☆☆ ｜ 预计用时：2~3 小时 ｜ 前置：09 课（模型类）+ 12 课（训练产物）
-> 学完本课你应能回答：**一个"可分发"的模型目录里有什么？auto_map 是什么？为什么 .pth 会"失忆"？**
-
----
+> [上一课 12-sft](../12-sft/README.md) ← [目录](../../README.md) → [下一课 14-final](../14-final/README.md)
+>
+> 难度：★★★☆☆ ｜ 预计用时 2~3 小时 ｜ 前置：09+12 课
 
 ## 0. 本课目标
 
-- [ ] 理解 HF 模型目录格式（config.json / pytorch_model.bin / tokenizer）与加载解析路径；
-- [ ] 理解两种路线：AutoClass 注册（minimind 路线） vs **自包含 remote-code**（本课新招：产物可脱离仓库运行）；
-- [ ] 理解 `.pth` 的"失忆"问题与 **sidecar config** 解法；
+- [ ] 理解 HF 模型目录格式、auto_map/remote-code、`.pth 失忆` 与 sidecar 解法；
 - [ ] 手写 `minimind3/convert.py` 双向转换（torch ⇄ HF）；
-- [ ] 验收 5 项新检查（13.1~13.5，累计 67 项全过）。
+- [ ] 验收 68 项累计（本课新增 13.1~13.5；13.3/13.5 是 1e-5 级高精度断言）。
 
----
+## 1. 理论速览
 
-## 1. 理论
+- **可分发目录**：`config.json`（蓝图）+ `pytorch_model.bin`（权重）+ tokenizer 两件 +（自包含版）`modeling_minimind3.py`。
+- **加载解析**：`AutoModelForCausalLM.from_pretrained(dir, trust_remote_code=True)` 读 config（`model_type`/`auto_map`）→ 定位类 → 实例化 → strict 载权重。
+- **路线 A（AutoClass 注册）**：`MiniMindConfig.register_for_auto_class()` + `MiniMindForCausalLM.register_for_auto_class("AutoModelForCausalLM")` → save 时写入 auto_map；局限：依赖环境/仓库。
+- **路线 B（自包含 remote-code，教程绝活）**：按依赖序拼接全部模型源码到 `modeling_minimind3.py`，auto_map 指向本地模块 → 产物目录拷到任何机器都能独立加载。两个关键：**config.py 放首位 + 头部 `from __future__ import annotations`**；去掉 `from .x import` 相对导入。
+- **⚠️ `.pth 失忆`**：`.pth` 只存张量；`rope_theta/max_position_embeddings` 等非张量超参不在里面 → 转换时用错默认值（rope_theta 1e6 错成 1e4）RoPE 频率全变 → 1e-5 一致性崩。**解法：sidecar `*.config.json`**（11/12 课 `save_weights(config=…)` 已自动写），转换优先读它；兜底从 `q_norm.weight` 维度读 head_dim（gcd 兜底不可靠：gcd(96,48)=48 会把 4头/2KV 猜成 2头/1KV）。
+- **其它约定**：`pad_token_id=0` 只在转换时设置；`safe_serialization=False`（写 bin）；改建模文件后要清 `~/.cache/huggingface/modules/transformers_modules/hf/`。
 
-### 1.1 一个可分发的模型目录里有什么？
+## 2. 任务要求（精确规格）
 
-训练的 `.pth` 只有一堆数字，孤岛一个。业界分发标准（HF）是一个**目录**：
+### 2.1 新建 `minimind3/convert.py`
 
-```
-config.json            ← 模型蓝图（结构尺寸 + 超参数）
-pytorch_model.bin      ← 权重（也可 safetensors）
-tokenizer.json + tokenizer_config.json
-modeling_minimind3.py  ←（自包含版）自定义结构的源码
-```
+**模块级**：`import json, os, re, sys`；`from pathlib import Path`；`import torch`；
+- `_REPO_ROOT: Path` = `Path(__file__).resolve().parent.parent`；
+- `_SRC_FILES: list[str]` = `["config.py","rms_norm.py","rope.py","attention.py","feed_forward.py","block.py","model_body.py","causal_lm.py"]`（**顺序不可改**）。
 
-`AutoModelForCausalLM.from_pretrained(dir)` 的解析流程：
-1. 读 `config.json`（含 `model_type` / `auto_map`）；
-2. 按它找/加载模型类；
-3. 实例化 → 载入权重（`strict=True` 校验键名）；
-4. 返回可推理的模型。
+### 2.2 函数与流程
 
-### 1.2 路线 A：AutoClass 注册（minimind 的做法）
+**`infer_config_from_state_dict(state_dict: dict, sidecar_path=None) -> MiniMindConfig`**：
+- sidecar 存在 → `MiniMindConfig(**json.load(sidecar))`；
+- 否则由张量形状推断：vocab/hidden 取 `model.embed_tokens.weight.shape`；层数 `max(…q_proj.weight)`+1；`head_dim = q_norm.weight.shape[0]`（无 q_norm 时 gcd 兜底）；`heads = hidden//head_dim`；`kv = k_dim//head_dim`；intermediate 取 `gate_proj.weight.shape[0]`。
 
-```python
-MiniMindConfig.register_for_auto_class()                       # auto_map 里写 AutoConfig
-MiniMindForCausalLM.register_for_auto_class("AutoModelForCausalLM")
-model.save_pretrained(dir)    # 会把 auto_map 写进 config.json
-```
+**`_gcd(a: int, b: int) -> int`**：欧几里得。
 
-之后**同一环境**里 `AutoModelForCausalLM.from_pretrained(dir, trust_remote_code=True)` 能加载。
-局限：auto_map 指向"模块路径"，换个没有该模块的环境就死——**依赖仓库**。
+**`convert_torch2transformers(torch_path, transformers_path, dtype=torch.float32, standalone=True) -> str`**：
+1. `state_dict = torch.load(torch_path, map_location="cpu")`；`sidecar = torch_path.replace(".pth", ".config.json")`；
+2. `lm_config = infer_config_from_state_dict(state_dict, sidecar)`；`lm_config.pad_token_id = 0`；
+3. 注册 AutoClass 两条；`model = MiniMindForCausalLM(lm_config)`；`miss, extra = load_state_dict(..., strict=False)`；**`assert not miss and not extra`**（键名必须全对上）；
+4. `.to(dtype)` → `save_pretrained(path, safe_serialization=False)` + `load_tokenizer().save_pretrained(path)`；
+5. `standalone=True` 时调 `_write_standalone_modeling`；print `[convert] …`；返回路径。
 
-### 1.3 路线 B：自包含 remote-code（本课新增的绝活）
+**`_write_standalone_modeling(out_dir: str) -> None`**：
+- 头部写 `from __future__ import annotations` + 说明注释；按 `_SRC_FILES` 逐个读 `minimind3/<name>` 源码，`re.sub(r"^from \.\w+ import .*$", "", src, flags=re.M)` 去掉包内相对导入，拼成 `modeling_minimind3.py`；
+- 改 `config.json`：`cfg["auto_map"] = {"AutoConfig": "modeling_minimind3.MiniMindConfig", "AutoModelForCausalLM": "modeling_minimind3.MiniMindForCausalLM"}`。
 
-把全部模型源码**按依赖顺序拼接**成一个 `modeling_minimind3.py` 放进产物目录，并改写 auto_map：
+**`_load_json(path) -> dict`**、**`_dump_json(path, data) -> None`**：json 读/写（utf-8、indent=2）。
 
-```json
-{"auto_map": {"AutoConfig": "modeling_minimind3.MiniMindConfig",
-              "AutoModelForCausalLM": "modeling_minimind3.MiniMindForCausalLM"}}
-```
+**`convert_transformers2torch(transformers_path, torch_path) -> str`**：`_load_from_hf` → `torch.save({k: v.float().cpu()…})`。
 
-转换成了**目录级 remote code**：该目录拷到任何机器（哪怕没有本仓库），`trust_remote_code=True`
-即可加载——**产物 = 可独立分发的成品**。拼接的两个关键：
-1. 按依赖顺序排序源码片段（config 在最前），头部加 `from __future__ import annotations`
-   （类体注解 `config: MiniMindConfig` 会立即求值，config 必须先定义）；
-2. 去掉 `from .x import ...` 相对导入，让所有类落在同一模块。
+**`_load_from_hf(transformers_path)`**：`AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True)`。
 
-### 1.4 ⚠️ 核心坑：`.pth` 会"失忆"
+**`__main__` 示例**：`convert_torch2transformers("out/full_sft_96.pth", "minimind3-hf/full_sft_96")` 后加载打印类型。
 
-`.pth` 只含**张量**。像 `rope_theta`（1e6）、`max_position_embeddings`、`rms_norm_eps` 这些
-**非张量超参**根本不进 state_dict！若转换时用默认值重建（比如 rope_theta 错成 1e4），
-RoPE 频率全变 → 模型输出完全不同 → 13.3/13.5 的 logits 一致性（1e-5）立刻红叉。
+## 3. 手写步骤
 
-**解法（最佳实践，本课已内置）**：训练脚本每次存权重时**同时写一个 sidecar `*.config.json`**
-（11/12 课保存逻辑已改）；转换时**优先读 sidecar**，缺失时才从张量形状推断结构尺寸
-（`q_norm.weight` 的维度 = head_dim，是最可靠的信号；gcd 兜底不可靠——gcd(96,48)=48 会让
-4 头 2 KV 变成 2 头 1 KV）。
+实现 §2.2 → `.venv/Scripts/python.exe verify.py 13`（13.3/13.5 含 subprocess 远端加载，约 30~60s）。
 
-### 1.5 本课其它约定与细节
+## 4. 验收解读（verify/13_convert.py）
 
-- `pad_token_id = 0` 只在**转换时**设置（不污染类默认值）：生态工具（padding/chat 模板）需要它；
-- 反向转换 `convert_transformers2torch`：HF → `.pth`（float32），可与 11/12 课权重互换；
-- `safe_serialization=False` → 写 `pytorch_model.bin`（标准实现同款；safetensors 列进阶）；
-- transformers 会把 remote code **缓存**到 `~/.cache/huggingface/modules/transformers_modules/...`——
-  改了建模文件必须清缓存或换目录名。
-
----
-
-## 2. 手写任务清单
-
-1. `infer_config_from_state_dict(sd, sidecar_path)`：sidecar 优先 + 形状推断兜底；
-2. `convert_torch2transformers`：加载（strict 校验）→ 注册 AutoClass → save_pretrained + tokenizer；
-3. `_write_standalone_modeling`：拼接源码 + 改写 auto_map（路线 B）；
-4. `convert_transformers2torch` + `_load_from_hf`（反向）；
-5. `__main__` 示例：`out/full_sft_96.pth → minimind3-hf/full_sft_96`；
-6. 验收。
-
-```bash
-.venv/Scripts/python.exe verify.py
-```
-
-## 3. 验收解读（verify/13_convert.py）
-
-| 检查 | 验什么 |
+| 检查（新） | 验什么 |
 |---|---|
-| 13.1 | 从随机 .pth 推断的 config == 期望（96/2/512/4/2/128：hidden/layers/vocab/heads/kv/intermediate） |
-| 13.2 | 产物文件齐全：config.json / pytorch_model.bin / tokenizer 两件 / modeling_minimind3.py；auto_map 指向**本地模块**；pad_token_id == 0 |
-| 13.3 | **AutoModelForCausalLM 加载后 logits == 原模型（1e-5）** |
-| 13.4 | **脱离仓库**：cwd 切到临时目录（仓库不在 sys.path）也能 remote-code 加载并生成 8 个 id |
-| 13.5 | 反向转换 transformers2torch 后再 strict 加载，logits == 原（1e-5）→ **round-trip 闭环** |
+| 13.1 | 随机 `.pth`（含 sidecar）推断 config == 期望（96/2/512/4/2/128） |
+| 13.2 | 产物文件齐全（config/bin/tokenizer×2/modeling_minimind3.py）；auto_map 指向**本地模块**；pad=0 |
+| 13.3 | **AutoModel 加载后 logits == 原模型（1e-5）** |
+| 13.4 | **脱离仓库**（cwd=临时目录、仓库不在 sys.path）也能 remote-code 加载并生成 8 个 id |
+| 13.5 | 反向转换后 strict 重载，logits == 原（1e-5）→ round-trip 闭环 |
 
-> 13.3/13.5 是整个教程精度最高的断言：`1e-5` 意味着**任何一处权重/超参/前向逻辑不一致都会被抓住**。
-> 当年开发时，sidecar 缺 rope_theta 的 bug 就是这样被 max diff 1.3e-1 定位的。
+> 1e-5 意味着任何权重/超参/前向不一致都会被抓住（开发期 max diff 1.3e-1 即 sidecar 缺 rope_theta 的现场）。
 
-## 4. 对照标准实现
+## 5. 参考答案
 
-| minimind3 | minimind 标准实现 |
+`answers/minimind3/convert.py`（先写后对；重点核对 sidecar 优先与 `_SRC_FILES` 顺序）。
+
+## 6. 常见坑
+
+- **sidecar 缺失**：非默认 rope_theta 模型转换后静默错乱（13.3 抓）；
+- **拼接顺序错**：config 放最后 → 类体注解 NameError（顺序 + `__future__ annotations` 双保险）；
+- **register_for_auto_class 忘在 save 前**：config.json 无 auto_map；
+- **忘 `trust_remote_code=True`**：报"找不到模型类"；
+- **remote code 缓存残留**：`~/.cache/huggingface/modules/transformers_modules/hf/` 清缓存或换目录名；
+- **`strict=False` 静默**：用 assert 显式暴露 miss/extra。
+
+## 7. 对照标准实现
+
+| 你手写 | minimind 标准 |
 |---|---|
 | `minimind3/convert.py` | `scripts/convert_model.py` |
 
-minimind 的转换目标更野：直接映射成 **Qwen3/Qwen3-MoE 原生类**（生态任意框架可加载），且有
-LoRA 合并等。教程主路 = 自包含 remote-code（等价能力、零外部依赖）；Qwen3 生态映射列为进阶。
+minimind 的目标更野：映射成 **Qwen3/Qwen3-MoE 原生类**（生态任意框架可加载，含 LoRA 合并）；教程主路 = 自包含 remote-code（等价能力、零外部依赖）；Qwen3 生态映射列为进阶。
 
-## 5. 常见坑（全部真实踩过）
+## 8. 小结
 
-- **sidecar 缺失** → 非默认 rope_theta 的模型转换后静默错乱（13.3 抓）；
-- **拼接顺序错**：config 片段放最后 → 类体注解 NameError（依赖顺序 + `__future__ annotations` 双保险）；
-- **`register_for_auto_class` 忘在 save 前调用**：config.json 没有 auto_map；
-- **`from_pretrained` 忘 `trust_remote_code=True`**：直接报"找不到模型类"；
-- **remote code 缓存残留**：改了建模文件后旧缓存坑你（删 `~/.cache/huggingface/modules/transformers_modules/hf/` 或换目录）；
-- **strict=False 静默**：宁可 `assert not miss and not extra` 显式暴露键名差异。
-
-## 6. 小结 & 下一课
-
-- ✅ HF 目录 = config + 权重 + tokenizer（+可选的源码）；
-- ✅ 路线 A 注册式（依赖环境） vs 路线 B 自包含式（可分发）；
-- ✅ .pth 失忆 → sidecar config 拯救；
-- ✅ 1e-5 round-trip = "转换无损"的机器保证。
-
-**下一课（14-final）**：收官！把 13 课产物串成一条 **端到端流水线**（合成数据 → 微预训练 → SFT →
-转换 → AutoModel 对话），检验"整个教程真的教会了一个模型说话"（内容级：它要能背出
-"猫是一种会抓老鼠的动物。"）。再加一个**一键全链验收脚本**，10 分钟内跑完 14 个分支。
+✅ 双向转换 + 1e-5 round-trip 保证 + 可独立分发的产物（含 sidecar 对治 `.pth 失忆`）。
+**下一课（收官）**：端到端流水线——从空权重到能背出事实的模型，一键跑完，毕业验收！

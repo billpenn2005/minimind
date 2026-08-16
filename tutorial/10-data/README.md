@@ -1,168 +1,125 @@
-# 第 10 课 · 分词器与数据集（tokenizer + ChatML + 掩码标签）
+# 第 10 课 · 分词器与数据集
 
-> 难度：★★☆☆☆ ｜ 预计用时：2~3 小时 ｜ 前置：09 课（知道 -100 是什么）
-> 学完本课你应能回答：**文本怎么变成 id？ChatML 模板长什么样？为什么 user 的 token 要被 -100 屏蔽？**
-
----
+> [上一课 09-causal-lm](../09-causal-lm/README.md) ← [目录](../../README.md) → [下一课 11-pretrain](../11-pretrain/README.md)
+>
+> 难度：★★☆☆☆ ｜ 预计用时 2 小时 ｜ 前置：09 课
 
 ## 0. 本课目标
 
-- [ ] 理解 BPE 分词原理与 minimind 6400 词表的来龙去脉；
-- [ ] 把仓库里的 tokenizer 文件接进 `minimind3/tokenizer/`，写 `tokenizer_utils.py` 包装层；
-- [ ] 理解 ChatML 模板（`<|im_start|>user/assistant`）与特殊 token id；
-- [ ] 手写 `datasets.py`：PretrainDataset + SFTDataset（含回答掩码标签）；
-- [ ] 验收 5 项新检查（10.1~10.5，累计 55 项全过）。
+- [ ] 理解 BPE 子词分词与 ChatML 模板；-100 掩码标签；
+- [ ] 拷贝词表素材，手写 `tokenizer_utils.py` + `datasets.py`；
+- [ ] 生成 `data/` 合成数据；
+- [ ] 验收 56 项累计（本课新增 10.1~10.5）。
 
----
+## 1. 理论速览
 
-## 1. 理论：分词器
+- **分词器**：文本 ⇄ token id（"猫会跑。" → [1968, 294, …]）；BPE 从字符开始迭代合并最频繁相邻对直到词表满 6400。**教程不重训词表**：复用 minimind 自训练词表（零下载），词表文件从 `answers/minimind3/tokenizer/` 拷贝。
+- **特殊 token**：`<|endoftext|>=0`、`<|im_start|>=1`、`<|im_end|>=2`（pad 惯例取 0）。
+- **ChatML**：
+  ```
+  <|im_start|>user\n什么是猫？<|im_end|>\n
+  <|im_start|>assistant\n猫是一种会抓老鼠的动物。<|im_end|>\n
+  ```
+- **-100 掩码**：SFT 只监督 assistant 回答；user/模板/pad 标签 = -100（隐身）。`generate_labels` 的扫描起点 = `tokenizer("<|im_start|>assistant\n", add_special_tokens=False).input_ids`（依赖 BPE 上下文无关切分：独立编码的子串 == 长句里的切片）。
 
-### 1.1 为什么需要分词器？
+## 2. 任务要求（精确规格）
 
-模型吃数字，人写字。分词器 = 双向的"编码/解码器"：
-
-```
-"猫会跑。" ──encode──▶ [1968, 294, 1950, ...]  ──decode──▶ "猫会跑。"
-```
-
-### 1.2 BPE：子词（subword）分词
-
-把词拆成"比字大、比词小"的**子词单元**：高频词整体一个 token（"猫"），罕见词拆成片段
-（"猫粮" → 猫 + 粮）。BPE 从字符开始迭代合并**最频繁出现的相邻对**，直到词表满 6400。
-
-minimind 的词表：**6400 tokens**（含特殊 token `<|endoftext|>=0`、`<|im_start|>=1`、`<|im_end|>=2`、
-对象引用/框选等工具类 token）。规模小的原因：6400 的词表让 embedding + lm_head 参数占比极小，
-对小模型更划算（499M 参数的等效占比 vs 64000 词表会吃掉一大块）。
-
-> 本教程**不重训**分词器：直接复用仓库已验证的词表文件（`model/tokenizer.json` +
-> `tokenizer_config.json`，已拷贝进 `minimind3/tokenizer/` 成为跟踪文件，见第 10 课提交）——
-> 零成本、生态兼容（`AutoTokenizer.from_pretrained("./minimind3/tokenizer")` 直接可用）。
-
-### 1.3 特殊 token 与 ChatML 模板
-
-对话不是"一句话"，而是**角色轮流说话**。ChatML 模板把对话线性化成一段文本：
-
-```
-<|im_start|>user
-什么是猫？<|im_end|>
-<|im_start|>assistant
-猫是一种会抓老鼠的动物。<|im_end|>
-<|im_start|>assistant
-```
-
-- `<|im_start|>`（id=1）开启一个角色轮次，`<|im_end|>`（id=2）关闭；
-- 训练时模型看到这样的序列，学"用户问什么 + 助手答什么"的完整因果模式；
-- 推理时我们手动拼一段以 `assistant\n` 结尾的模板，让模型接着续写回答（14 课的 e2e 就这么干）。
-
-### 1.4 -100 掩码标签：只监督"回答"
-
-SFT 的目标不是"让模型背下用户的问题"，而是"学会回答"。所以标签设计：
-
-| token 来源 | 标签 | 参与损失？ |
-|---|---|---|
-| system / user 的提问、模板标签 | **-100** | ❌（隐身） |
-| assistant 的回答内容 | 真实 token id | ✅ |
-
-实现 `generate_labels` 的经典手法：先用 `tokenizer("<|im_start|>assistant\n")`（无 add_special_tokens）
-得到**起始标记 token 序列**，在整段 id 里**扫描**它出现的位置，从那里一路标记到下一个
-`<|im_end|>`（含），其余全部 -100。
-
-> 这个记号扫描依赖一个 BPE 特性：**同样的子串在上下文里独立编码时，切分结果与它在长句里一致**
-> （编码是上下文无关的分片）。本课验收 10.3/10.4 会精确验证"user 区全 -100、assistant 区等于原文"。
-
----
-
-## 2. 阅读参考答案
-
-### 2.1 `tokenizer_utils.py`
-
-```python
-TOKENIZER_DIR = Path(__file__).parent / "tokenizer"
-
-def load_tokenizer():          # 懒加载单例（只加载一次）
-    return AutoTokenizer.from_pretrained(str(TOKENIZER_DIR))
-
-IM_START_ID, IM_END_ID = 1, 2  # 与词表一致
-
-def build_chat_prompt(conversations):   # [{role, content}, ...] → ChatML 文本
-    ...
-
-def encode_chat(text, max_length):      # 编码 + 截断，特殊 token 由模板负责
-    ...
-
-def generate_labels(input_ids):         # assistant 掩码扫描
-    start_marker = tokenizer("<|im_start|>assistant\n", add_special_tokens=False).input_ids
-    ... # 扫到 start_marker 就从这里标记至下一个 <|im_end|>，其余 -100
-```
-
-### 2.2 `datasets.py`
-
-```python
-class PretrainDataset(Dataset):
-    # load_dataset("json", data_files=...) → 每条 text 切成 max_length-2
-    # 包 <bos> + text + <eos>，右边 pad 到 max_length
-    # labels = input_ids 复制，pad 位标 -100
-    # 返回 (input_ids, labels)
-
-class SFTDataset(Dataset):
-    # 手读 jsonl（utf-8）→ build_chat_prompt → encode → generate_labels
-    # 返回 (input_ids, labels)
-```
-
----
-
-## 3. 手写任务清单
-
-1. 确认 `minimind3/tokenizer/` 下有 `tokenizer.json` + `tokenizer_config.json`，`AutoTokenizer` 能加载（词表 6400、bos=1、eos=2、pad=0）；
-2. `tokenizer_utils.py`：懒加载单例 + 三个 helper；
-3. `datasets.py`：两个 Dataset 类（注意 Windows 上**先 import datasets 再 import torch**，规避 pyarrow DLL 冲突）；
-4. 生成/确认合成数据：`tools/make_synthetic_data.py --out data --num 300`；
-5. 验收。
+### 2.1 拷贝素材（本课非手写部分）
 
 ```bash
-.venv/Scripts/python.exe verify.py
+cp -r answers/minimind3/tokenizer minimind3/tokenizer   # 词表 + 配置（约 0.5MB）
 ```
+（也可 `git show` 任一含该目录的提交；最终效果一致：`minimind3/tokenizer/` 下要有 `tokenizer.json` 与 `tokenizer_config.json`。）
+
+### 2.2 新建 `minimind3/tokenizer_utils.py`
+
+**模块级**：
+- `TOKENIZER_DIR: Path` = `Path(__file__).resolve().parent / "tokenizer"`；
+- `IM_START_ID: int = 1`；`IM_END_ID: int = 2`；
+- 模块私有 `_tokenizer = None`（惰性单例）。
+
+| 函数 | 签名 | 返回（类型） | 行为 |
+|---|---|---|---|
+| `load_tokenizer` | `() -> AutoTokenizer` | tokenizer | 惰性 `AutoTokenizer.from_pretrained(str(TOKENIZER_DIR))`，缓存单例 |
+| `build_chat_prompt` | `(conversations: list[dict]) -> str` | `str` | 逐条 `<|im_start|>{role}\n{content}<|im_end|>\n` 拼接；`role` 必须 ∈ {system,user,assistant}（否则 assert） |
+| `encode_chat` | `(conversations: list[dict], tokenizer=None, max_length: int \| None = None) -> list[int]` | `list[int]` | `tokenizer(text, add_special_tokens=False, truncation=True, max_length=max_length).input_ids`（**必须 add_special_tokens=False**） |
+| `generate_labels` | `(input_ids: list[int], tokenizer=None) -> list[int]` | `list[int]` | 全 -100 起；找 `start_marker` 起点，标记到（含）下一个 `<|im_end|>` 为真实标签 |
+
+### 2.3 新建 `minimind3/datasets.py`
+
+**模块级 import**：`json`、`torch`、`from datasets import load_dataset`、`from torch.utils.data import Dataset`、`from .tokenizer_utils import IM_END_ID, IM_START_ID, encode_chat, generate_labels, load_tokenizer`。
+
+**`class PretrainDataset(Dataset)`**：
+
+| 成员 | 类型 | 值 |
+|---|---|---|
+| `tokenizer` | AutoTokenizer | 构造参数 2 或 `load_tokenizer()` |
+| `max_length` | `int` | 构造参数 3（默认 512） |
+| `samples` | Dataset | `load_dataset("json", data_files=data_path, split="train")` |
+
+- `__init__(self, data_path: str, tokenizer=None, max_length: int = 512)`；
+- `__len__() -> int`；
+- `__getitem__(self, index) -> tuple[Tensor, Tensor]`：
+  - 取 `samples[index]["text"]`；`tokenizer(text, add_special_tokens=False, max_length=max_length-2, truncation=True)`；
+  - 包 `[bos] + tokens + [eos]`，右侧补 `pad_token_id` 到 max_length；
+  - 返回 `(input_ids long (max_length,), labels long (max_length,))`；`labels = input_ids.clone()`，**pad 位 = -100**。
+
+**`class SFTDataset(Dataset)`**：
+
+| 成员 | 类型 | 值 |
+|---|---|---|
+| `tokenizer` | AutoTokenizer | 构造参数 2 或 `load_tokenizer()` |
+| `max_length` | `int` | 构造参数 3（默认 512） |
+| `samples` | `list[dict]` | `_load_jsonl(jsonl_path)` |
+
+- `__init__(self, jsonl_path: str, tokenizer=None, max_length: int = 512)`；
+- `@staticmethod _load_jsonl(jsonl_path: str) -> list[dict]`：utf-8 逐行 `json.loads`（跳过空行）；
+- `__len__() -> int`；
+- `__getitem__`：`encode_chat(conversations, tokenizer, max_length)` → 右侧补 pad → `generate_labels`；返回 `(input_ids long, labels long)`（labels 里 assistant 区是真实 id、其余 -100）。
+
+### 2.4 生成数据（第 10 课起 `data/` 可存在）
+
+```bash
+.venv/Scripts/python.exe -m tools.make_synthetic_data --out data --num 300 --seed 0
+```
+产物 `data/tiny_pretrain.jsonl`（`{"text":…}` ×300）与 `data/tiny_sft.jsonl`（`{"conversations":[…]}` ×300）；内容与 `answers/data/` 逐字节相同（同种子）。
+
+## 3. 手写步骤
+
+拷贝 §2.1 → 写 §2.2 → 写 §2.3 → 生成 §2.4 → `verify.py 10`（**训练类检查用 `.venv/Scripts/python.exe`，datasets 依赖在其 venv 里**）。
 
 ## 4. 验收解读（verify/10_data.py）
 
-| 检查 | 验什么 |
+| 检查（新） | 验什么 |
 |---|---|
-| 10.1 | 分词器可加载：vocab 6400、bos/eos/pad id 正确、`encode→decode` 往返一致 |
-| 10.2 | `build_chat_prompt` 产出含 `<|im_start|>`/`<|im_end|>` 的模板；IM 恰为单 id 1/2 |
-| 10.3 | PretrainDataset：形状、bos/eos 包裹、pad 区标签为 -100 |
-| 10.4 | SFTDataset：**user 区全 -100、assistant 区 == 原文 id**（整段子序列扫描断言） |
-| 10.5 | 样本里非 -100 标签数 > 0 | 
+| 10.1 | 分词器可加载：vocab 6400、bos=1/eos=2/pad=0；encode→decode 往返一致 |
+| 10.2 | ChatML 拼接含 `<|im_start|>`/`<|im_end|>`；IM 恰为单 id 1/2 |
+| 10.3 | PretrainDataset：形状、bos/eos 包裹、pad 区标签 -100 |
+| 10.4 | SFTDataset：**user 区全 -100、assistant 区 == 原文 id**（整段子序列扫描断言——单 token 定位会撞到文本里的相同字符） |
+| 10.5 | 每条样本非 -100 标签 > 0 |
 
-> 10.4 是本课灵魂：用整段连续子序列扫描（而非 `ids.index`）找标记——`index` 找首个匹配会撞上
-> 文本里恰好相同的字符（例如"猫"出现在提问里），必须全窗口匹配。
+## 5. 参考答案
 
-## 5. 对照标准实现
-
-| minimind3 | minimind 标准实现 |
-|---|---|
-| `minimind3/tokenizer_utils.py` | `model/` 的 tokenizer 文件（打包层） |
-| `minimind3/datasets.py` | `dataset/lm_dataset.py` |
-
-教程有意**简化**：标准实现的 SFTDataset 支持 tools / reasoning_content / 多模态占位等；教程只保留
-核心 ChatML + 掩码（进阶见 10 课"进阶"）。`generate_labels` 的"起始标记通过独立 tokenizer 调用得到"
-这一手与 minimind 的 `f'{bos}assistant\n'` 字符串扫法**数学等价但更稳**（不受特殊 token 粘连影响）。
+`answers/minimind3/tokenizer_utils.py`、`answers/minimind3/datasets.py`（先写后对）。
 
 ## 6. 常见坑
 
-- **Windows pyarrow DLL 冲突**：datasets 必须在 torch 之前 import（或用单进程加载）；
-- **`add_special_tokens=False`** 忘写：编码时自动加 bos/eos，掩码扫描全乱；
-- **截断把 assistant 回答切掉**：SFT 的 `max_seq_len` 必须 ≥ 模板+问题+回答；`truncation` 从**右**切，
-  回答在尾部最容易被切——实测教训（12 课还会强调）；
-- **右 pad 与左 pad**：训练用右 pad；生成时若用左 pad 要小心位置错位；
-- **GBK 控制台打印中文**：终端乱码 ≠ 数据错（编码/解码往返正确即真值）。
+- **Windows pyarrow DLL 冲突**：任何脚本顶部 **先 import datasets 再 import torch**；
+- **`add_special_tokens` 忘关**：自动加 bos/eos 弄乱掩码扫描；
+- **截断吃掉回答**：`max_seq_len` 必须 ≥ 模板+问题+回答（`truncation` 从右切，回答在尾部最先被切）；
+- **用 `ids.index` 找标记**：会命中文本中相同的首个字符——要整段连续子序列匹配；
+- **GBK 控制台打印中文乱码**：正常；数据正确性以 encode/decode 往返为准。
 
-## 7. 小结 & 下一课
+## 7. 对照标准实现
 
-- ✅ BPE 子词分词 + 6400 词表复用（零下载、生态兼容）；
-- ✅ ChatML 模板与特殊 token（`<|im_start|>`/`<|im_end|>`）；
-- ✅ -100 掩码：user 隐身、只监督 assistant；
-- ✅ 合成数据 schema 与 minimind 真实数据完全一致——交换 `--data_path` 即可升级大语料。
+| 你手写 | minimind 标准 |
+|---|---|
+| `minimind3/tokenizer_utils.py` | `model/` 词表 + 模板逻辑 |
+| `minimind3/datasets.py` | `dataset/lm_dataset.py` |
 
-**下一课（11-pretrain）**：终于开始训练！手写**预训练循环**：余弦退火学习率、梯度裁剪、
-梯度累积、checkpoint/断点续训（`_resume.pth`）、可复现种子。验收会真的在 CPU 上跑一个小模型，
-断言 loss 逐轮下降。
+教程有意简化（去掉 tools/reasoning_content 支持）；`generate_labels` 用独立 marker 扫描，比 minimind 的 `f'{bos}assistant\n'` 字符串扫法更稳（不受特殊 token 粘连影响），数学等价。
+
+## 8. 小结
+
+✅ 文本 ⇄ id 全链路打通（词表复用 + ChatML + 掩码 + 可复现数据）。
+**下一课**：终于开始训练——预训练循环（cosine 退火、裁剪、累积、断点续训）。

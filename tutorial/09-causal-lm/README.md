@@ -1,161 +1,122 @@
-# 第 09 课 · 因果语言模型 MiniMindForCausalLM（lm_head + 损失 + generate）
+# 第 09 课 · 因果语言模型 MiniMindForCausalLM
 
-> 难度：★★★☆☆（全程最重的一课：8 项验收）｜ 预计用时：3~4 小时 ｜ 前置：08 课模型主体
-> 学完本课你应能回答：**hidden 怎么变成词表概率？权重绑定省多少参数？shift 损失错位在哪？generate 的采样策略各在干什么？**
-
----
+> [上一课 08-model](../08-model/README.md) ← [目录](../../README.md) → [下一课 10-data](../10-data/README.md)
+>
+> 难度：★★★☆☆（全程最重：8 项验收）｜ 预计用时 3~4 小时 ｜ 前置：08 课
 
 ## 0. 本课目标
 
-- [ ] 理解 lm_head（输出头）与**权重绑定**（tie word embeddings）；
-- [ ] 理解 next-token 损失的**错位（shift）**与 `ignore_index=-100`；
-- [ ] 继承 `PreTrainedModel + GenerationMixin`，实现保存/加载；
-- [ ] 手写带温度 / top-k / top-p / 重复惩罚 / KV 增量 / 早停的 `generate`；
-- [ ] 验收 8 项新检查（09.1~09.8，累计 50 项全过）。
+- [ ] 理解 lm_head、**权重绑定**、**shift 损失**、generate 采样策略全家桶；
+- [ ] 手写 `minimind3/causal_lm.py`；
+- [ ] 验收 51 项累计（本课新增 09.1~09.8）。
 
----
+## 1. 理论速览
 
-## 1. 理论
+- **lm_head**：`logits = h·W_lmᵀ`（`[B,S,vocab]`）→ softmax → 下个 token 概率；`W_lm` 与 embed 表同构。
+- **权重绑定**：`model.embed_tokens.weight = model.lm_head.weight`（同一 Parameter）——省 `vocab×hidden`（默认 6400×768≈4.9M，约占总参 8%），效果更好。声明 `_tied_weights_keys` 让 HF 保存/加载自动去重。**必须在 `post_init()` 之前绑定**（否则 post_init 会重新初始化 lm_head 破坏同一性）。
+- **shift 损失**：`logits[..., :-1]` 预测 `labels[..., 1:]`，交叉熵 `ignore_index=-100`（padding/非监督位置的隐身标签，第 10 课制造）。
+- **继承 `PreTrainedModel + GenerationMixin`**：白送 `save_pretrained/from_pretrained`，并注册为可用的 transformers 模型类（`config_class`）。
+- **generate 策略**：贪心（argmax）｜温度 `softmax(logits/T)`（T→0 收敛贪心）｜top-k（保前 k 大）｜top-p（按概率累计到 p 的动态裁剪）｜重复惩罚（出现过的 token 分数 除以/乘 repetition_penalty）｜eos 早停｜KV 增量（每轮只喂 `input_ids[:, past_len:]`）。
 
-### 1.1 从语义屋到词表概率：lm_head
+## 2. 任务要求（精确规格）
 
-主体模型输出每个 token 的 768 维"语义向量"。要变成"下一个词是哪个"的概率，需要最后一跳：
+### 2.1 新建 `minimind3/causal_lm.py`
 
-$$
-\text{logits} = h \cdot W_{lm}^\top \in \mathbb{R}^{\text{vocab}}
-\xrightarrow{\text{softmax}}
-P(\text{next token})
-$$
+**模块级 import**：`torch`、`torch.nn.functional as F`、`from torch import nn`、`from transformers import GenerationMixin, PreTrainedModel`、`from transformers.modeling_outputs import MoeCausalLMOutputWithPast`、`from .config import MiniMindConfig`、`from .model_body import MiniMindModel`。
 
-`W_lm` 形状 `(vocab, hidden)`，叫 **lm_head（语言模型头）**。它与输入侧的另一张表长得一模一样——
-这就引出了权重绑定。
+### 2.2 `class MiniMindForCausalLM(PreTrainedModel, GenerationMixin)`
 
-### 1.2 权重绑定：一张表，两处用
-
-输入侧需要"id → 向量"的 embed 表（`[vocab, hidden]`）；输出侧需要"hidden → 分数"的 lm_head
-（`[vocab, hidden]`，转置后相乘）。**语义上它们是同一回事**（同一个词就是同一个向量），于是：
-
-```python
-model.embed_tokens.weight = model.lm_head.weight   # 共享同一个 Parameter！
-```
-
-- 参数量立省 `vocab × hidden`：默认配置 6400×768 ≈ **4.9M**（约总参数量 64M 的 8%）；
-- 效果还更好（embed 与输出分布自然对齐，经典研究也支持）；
-- 兑现方式（与 minimind 相同）：在 `post_init()` **之前**把两个 name 指向同一个 Parameter 对象，
-  并声明 `_tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}` 让 transformers
-  保存/加载时自动处理绑定关系。
-
-### 1.3 训练目标：下一个 token 的错位损失
-
-一个句子 `[x1, x2, x3, x4]`，模型在每个位置预测"下一个"：位置 1 的标签是 x2，位置 2 的标签是 x3……
-所以**模型输出切掉最后一格**（`logits[..., :-1]`），**标签切掉第一格**（`labels[..., 1:]`）：
-
-```python
-shift_logits = logits[..., :-1, :].contiguous()
-shift_labels = labels[..., 1:].contiguous()
-loss = F.cross_entropy(shift_logits.view(-1, vocab), shift_labels.view(-1), ignore_index=-100)
-```
-
-**`ignore_index=-100`** 是数据侧送来的约定（10 课详述）：标签值为 -100 的位置不参与损失——
-padding、user 提问等"不该学"的 token 就靠这个数字隐身。cross_entropy 遇到 -100 直接跳过该行。
-
-> 为什么叫"因果"？生成方向单向（只看过去），训练目标也是单向接龙——这就是 causal LM。
-
-### 1.4 继承 PreTrainedModel + GenerationMixin：生态级能力
-
-```python
-class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
-    config_class = MiniMindConfig                      # 让 AutoConfig 知道
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-```
-
-- `PreTrainedModel` 白送：`save_pretrained(dir)` / `from_pretrained(dir)` / `to()` / `train()`……（13 课深度使用）；
-- `GenerationMixin` 白送：`model.generate(...)` 官方生成接口（本教程也自己实现一套"纯手写版"对照理解）。
-
-### 1.5 手写 generate：采样策略全家桶
-
-生成 = 循环"预测分布 → 选 token → 拼上 → 再预测"。质量由"怎么选"决定：
-
-| 策略 | 规则 | 直觉 |
+| 类属性 | 类型 | 值 |
 |---|---|---|
-| **贪心（greedy）** | 每步取 argmax | 最稳定但容易复读/单调 |
-| **温度 temperature** | `logits / T` 后再 softmax；T→0 接近贪心，T→1 原样，T>1 更"乱" | 调节赌注的胆量 |
-| **top-k** | 只保留概率最高的 k 个，其余 -inf | 砍掉"明显离谱"的尾巴 |
-| **top-p** | 按概率降序累加，直到累计 ≥ p 的集合保留 | 动态 k：分布集中时留少，平坦时留多 |
-| **重复惩罚** | 对已生成过的 token 分数除以 `repetition_penalty`（>1 抑制） | 治复读机 |
+| `config_class` | type | `MiniMindConfig` |
+| `_tied_weights_keys` | `set[str]` | `{"lm_head.weight": "model.embed_tokens.weight"}` |
 
-实现的三个易错点：
-1. **top-p 移位**：mask 需要 `mask[..., 1:] = mask[..., :-1].clone()`——因为 softmax 已经"吃掉"一维概率轴，
-   你原本的排序索引要跟着分布错位；
-2. **温度先 softmax 还是先采样**：`probs = softmax(logits / temperature)`，multinomial 从 probs 采样；
-3. **KV 增量**：每轮只把 `input_ids[:, past_len:]` 喂给模型（而不是整段），缓存不断追加——
-   与 05/08 课的 `past_key_values` 闭环。
+**`__init__(self, config: MiniMindConfig | None = None)`**：
+1. `self.config = config or MiniMindConfig()`；`super().__init__(self.config)`；
+2. `self.model = MiniMindModel(self.config)`；
+3. `self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)`；
+4. 若 `config.tie_word_embeddings`：`self.model.embed_tokens.weight = self.lm_head.weight`（**此刻、post_init 之前**）；
+5. `self.post_init()`。
 
-再加**早停**：`eos_token_id` 被生成就标记该样本 finished；全部 finished 就提前退出（不浪费算力）。
+**`forward(self, input_ids=None, attention_mask=None, past_key_values=None, use_cache=False, logits_to_keep=0, labels=None, **kwargs)`**：
 
----
+| 参数 | 类型 | 默认 |
+|---|---|---|
+| `input_ids` | `Tensor (B,S) \| None` | `None` |
+| `attention_mask` | `Tensor \| None` | `None` |
+| `past_key_values` | `list \| None` | `None` |
+| `use_cache` | `bool` | `False` |
+| `logits_to_keep` | `int` | `0`（0=保留全部位置） |
+| `labels` | `Tensor (B,S) int64 \| None` | `None`（labels 含 -100） |
+| `**kwargs` | — | 透传 model |
 
-## 2. 阅读参考答案（minimind3/causal_lm.py）
+返回：`MoeCausalLMOutputWithPast`，字段：
+- `loss: Tensor \| None`（labels 非 None 时）：`F.cross_entropy(shift_logits.view(-1,vocab), shift_labels.view(-1), ignore_index=-100)`；
+- `logits: Tensor (B, S_or_keep, vocab)`；`past_key_values`（presents）；`hidden_states`；`aux_loss: Tensor`。
 
-- `__init__`：`self.model = MiniMindModel(config)`；在 `post_init()` 之前把 `lm_head` 与 `embed_tokens`
-  绑定成同一 Parameter；头里 `slots = max(1, config.num_hidden_layers)` 预留 KV 槽；
-- `forward`：`logits_to_keep` 时延后切头（只对最后 k 个位置做 lm_head，训练长序列省算力）；
-  标签存在时算 shift 损失；返回 `MoeCausalLMOutputWithPast(loss, logits, presents, aux_loss)`；
-- **generate**：复刻 minimind 的实现（temperature/top_k/top_p/repetition_penalty/streamer/return_kv），
-  不开 tokenizer（纯 id 操作），* 留一个 `generate_transformer`（调用父类 GenerationMixin）作对照。
+**内部**：
+1. `hidden, past_kv, aux = self.model(input_ids, attention_mask, past_key_values, use_cache, **kwargs)`；
+2. `slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep`；`logits = lm_head(hidden[:, slice_indices, :])`；
+3. 损失：`x = logits[..., :-1, :].contiguous()`；`y = labels[..., 1:].contiguous()`；CE（**shift 是"logits 去尾、labels 去头"，必须 contiguous**）。
 
-## 3. 手写任务清单
+### 2.3 `generate`（自实现，装饰 `@torch.inference_mode()`）
 
-1. 类头：`config_class` + `_tied_weights_keys`；
-2. `__init__`：主体模型 + lm_head，**绑定在 post_init 之前**；
-3. `forward`：logits（含 `logits_to_keep` 优化）+ shift 损失 + 输出对象；
-4. generate：贪心 → 温度 → top-k → top-p → 重复惩罚 → eos 早停 → KV 增量逐项加上；
-5. 保存/加载可直接用父类（能 `save_pretrained` 就成功）；
-6. 验收。
+**签名**：
 
-```bash
-.venv/Scripts/python.exe verify.py
+```python
+def generate(self, inputs=None, attention_mask=None, max_new_tokens=1024, temperature=0.85,
+             top_p=0.85, top_k=50, eos_token_id=2, streamer=None, use_cache=True,
+             num_return_sequences=1, do_sample=True, repetition_penalty=1.0, **kwargs)
 ```
+- `inputs`：`Tensor (B,S) int64`（或经 `kwargs["input_ids"]` 传入）；返回：`Tensor (B, S+new)` int64（`kwargs["return_kv"]=True` 时返回 `{"generated_ids":…, "past_kv":…}` 字典）。
+
+**行为要求（顺序固定）**：
+1. `input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)`；mask 同步 repeat；`finished = zeros(B, bool)`；
+2. 循环 ≤ max_new_tokens 次：
+   a. `past_len = past_key_values[0][0].shape[1] if past_key_values else 0`；
+   b. 前向仅喂 `input_ids[:, past_len:]`（增量！）；mask 尾部补 1；
+   c. `logits = outputs.logits[:, -1, :] / temperature`；
+   d. 重复惩罚（`repetition_penalty != 1.0` 时，对每行已见 token：`score>0 → score/rp`，否则 `score*rp`）；
+   e. top-k（`top_k>0`：低于第 k 大的置 -inf）；top-p（`top_p<1.0`：排序累计概率 >p 的置 -inf，**`mask[..., 1:] = mask[..., :-1].clone()` 移位、最低位归 0**）；
+   f. `next_token`：`do_sample` → `multinomial(softmax(logits),1)`，否则 `argmax`；`eos_token_id` 下已 finished 行强制 eos；
+   g. 拼接、更新 past、`finished |= (next_token==eos)`；全 finished 提前 break；streamer.put；
+3. `streamer.end()`（若提供）；按 `return_kv` 返回。
+
+## 3. 手写步骤
+
+按 §2.2→§2.3 实现 → `.venv/Scripts/python.exe verify.py 09`。
 
 ## 4. 验收解读（verify/09_causal_lm.py）
 
-| 检查 | 验什么 |
+| 检查（新） | 验什么 |
 |---|---|
-| 09.1 | logits 形状；`lm_head.weight is model.embed_tokens.weight`（同一对象）；`h@W^T` 一致 |
-| 09.2 | 手动 shift 的交叉熵 == 模型 loss（1e-6）；-100 位置确实被忽略 |
-| 09.3 | 12 步 AdamW 在固定随机数据上，loss 降到初值 95% 以下（模型真的能学） |
-| 09.4 | 贪心生成：长度正确、结果确定可复现 |
-| 09.5 | eos 提前停止生效 |
-| 09.6 | temperature/top_k/top_p/repetition_penalty 都能跑通且改变结果 |
-| 09.7 | **KV 缓存开 vs 关，生成结果完全一致**（缓存只是提速，不改变输出） |
-| 09.8 | `save_pretrained` → `from_pretrained` 往返后 logits 一致（1e-5）（AutoClass 注册留到 13 课） |
+| 09.1 | logits 形状；**`lm_head.weight is model.embed_tokens.weight`（同一对象）**；`h@Wᵀ` 一致 |
+| 09.2 | 手动 shift CE == 模型 loss（1e-6）；-100 被忽略 |
+| 09.3 | 12 步 AdamW 在固定数据上 loss < 初值 95%（真能学） |
+| 09.4 | 贪心生成长度/确定性 |
+| 09.5 | eos 早停 |
+| 09.6 | temperature/top_k/top_p/repetition_penalty 跑通且改变结果 |
+| 09.7 | **KV开 == KV关 生成结果一致**（缓存不改变输出） |
+| 09.8 | `save_pretrained → from_pretrained` 往返 logits 一致（1e-5） |
 
-## 5. 对照标准实现
+## 5. 参考答案
 
-| minimind3 | minimind 标准实现 |
-|---|---|
-| `minimind3/causal_lm.py` | `model/model_minimind.py` 的 `MiniMindForCausalLM` |
+`answers/minimind3/causal_lm.py`（先写后对；重点核对绑定时机、top-p 移位、incremental 喂入）。
 
-对齐点：权重绑定时机、`_tied_weights_keys`、`logits_to_keep` 切片、自定义 generate 参数全集、
-`MoeCausalLMOutputWithPast`。差异点：minimind 用 `add_start_docstrings` 装饰器（教程省掉）；
-教程额外提供 `generate_transformer`（父类对照）与更完整的单测。
+## 6. 常见坑
 
-## 6. 常见坑（真实踩过）
+- **绑定在 post_init 后**：09.1 的 `is` 断言抓；
+- **shift 忘 contiguous**：view 报错或静默错位；
+- **top-p mask 不移位/不 clone**：`mask[...,1:] = mask[...,:-1].clone()` 右值必须独立拷贝；
+- **温度后直接采样忘 softmax**：multinomial 要求非负和=1；
+- **增量生成又喂全量**：结果对、速度差——增量必须 `input_ids[:, past_len:]`；
+- **绑定时两个 weight 形状不同**：`nn.Linear(hidden, vocab)` 权重形状是 `(vocab, hidden)`，`nn.Embedding(vocab, hidden)` 是 `(vocab, hidden)`——一致才能绑定。
 
-- **绑定在 `post_init()` 之后才做**：`post_init` 里 `_init_weights` 会重新初始化 lm_head，绑定失效
-  （验收 09.1 的 `is 同一对象` 直接抓）；
-- **shift 忘了 `.contiguous()`**：`view` 在切片视图上会报"size mismatch"或静默错位；
-- **top-p 的 mask 不移位**：`mask[..., 1:] = mask[..., :-1]` 的右值必须 `.clone()`（否则共享内存自覆盖）；
-- **温度后直接 argmax 忘了 softmax**：multinomial 要求非负且和为 1，`probs` 需显式 `softmax`；
-- **增量生成又喂整段**：第 2 轮起 `input_ids[:, past_len:]`，否则缓存形同虚设（结果仍对、只是慢）；
-- **`eos` 用 float 判断**：`torch.isfinite` 对 Python float 会类型报错——生成 id 是 int，比较用
-  `torch` 或转 `math` 处理。
+## 7. 对照标准实现
 
-## 7. 小结 & 下一课（里程碑！）
+`answers/minimind3/causal_lm.py` 对齐 minimind `MiniMindForCausalLM`（绑定、`_tied_weights_keys`、logits_to_keep、generate 参数全集）；教学另留 `generate_transformer`（调父类 GenerationMixin 对照）与更完整单测。
 
-🎉 **到这里，模型核心全部完成**：config → RMSNorm → RoPE → Attention → FFN → Block → Model →
-ForCausalLM(损失 + 生成 + 保存加载)。50 项验收全过，你已经"拥有"了一个能训练、能对话的完整语言模型结构！
+## 8. 小结（里程碑 🎉）
 
-**下一课（10-data）**：把文本变成模型能吃的数字——接入 minimind 的 6400 词表 BPE 分词器，
-并手写 Pretrain/SFT 数据集类。你将看到 ChatML 模板（`<|im_start|>`）与 **-100 掩码标签**（user 提问
-不参与损失，只监督 assistant 回答）如何落地。
+✅ 模型核心全部完成：config→RMSNorm→RoPE→Attention→FFN→Block→Model→ForCausalLM（损失+生成+保存/加载）。
+**下一课**：文本 → id——接入分词器、ChatML 模板与 -100 掩码标签。

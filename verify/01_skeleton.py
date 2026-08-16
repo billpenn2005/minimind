@@ -19,21 +19,65 @@ def register(name):
     return deco
 
 
-@register("01.1 项目骨架文件齐全")
+@register("01.1 项目骨架文件齐全（含参考答案就位）")
 def check_skeleton(args):
+    # 分支自带（快照/工具/验收框架）
     for rel in [
         "README.md",
         "requirements.txt",
         ".gitignore",
-        "minimind3/__init__.py",
         "tools/make_synthetic_data.py",
         "verify.py",
         "verify/_common.py",
         "verify/01_skeleton.py",
         "AGENTS.md",
         "tutorial/01-skeleton/README.md",
+        # 参考答案：完整实现 + 规范数据（先写后对；绝不外借到工作区）
+        "answers/minimind3/__init__.py",
+        "answers/data/tiny_pretrain.jsonl",
+        "answers/data/tiny_sft.jsonl",
+        # 本课产物：包入口（学习者手写）
+        "minimind3/__init__.py",
     ]:
         assert (REPO_ROOT / rel).exists(), f"缺少文件: {rel}"
+
+
+@register("01.x 按课留白：minimind3/ 只允许存在 ≤ 当前课的产物文件（防跳课/防回拷答案）")
+def check_blank_start(args):
+    # 每课新增的文件（第 01 课只有包入口）
+    _FILES_BY_LESSON = {
+        2: {"config.py"},
+        3: {"rms_norm.py"},
+        4: {"rope.py"},
+        5: {"attention.py"},
+        6: {"feed_forward.py"},
+        7: {"block.py"},
+        8: {"model_body.py"},
+        9: {"causal_lm.py"},
+        10: {"tokenizer_utils.py", "datasets.py"},
+        11: {"train_utils.py", "train_pretrain.py"},
+        12: {"train_full_sft.py"},
+        13: {"convert.py"},
+        14: {"e2e.py"},
+    }
+    limit = getattr(args, "lesson", None) or 14
+    allowed = {"__init__.py"}
+    for i in range(1, limit + 1):
+        allowed |= _FILES_BY_LESSON.get(i, set())
+    pkg = REPO_ROOT / "minimind3"
+    if pkg.exists():
+        for p in pkg.iterdir():
+            if p.name == "__pycache__":
+                continue
+            if p.is_dir():
+                assert p.name == "tokenizer" and limit >= 10, \
+                    f"minimind3/ 出现未知目录 {p.name}（第 {limit} 课不应有）"
+            else:
+                assert p.name in allowed, \
+                    f"minimind3/{p.name} 不属于第 {limit} 课（跳课或回拷答案？）"
+    # data/ 第 10 课起才生成
+    if limit < 10:
+        assert not (REPO_ROOT / "data").exists(), "data/ 应留到第 10 课再生成，现在应不存在"
 
 
 @register("01.2 合成预训练数据可生成且可复现")

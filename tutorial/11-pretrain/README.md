@@ -1,145 +1,120 @@
-# 第 11 课 · 预训练循环（train_pretrain.py）
+# 第 11 课 · 预训练循环
 
-> 难度：★★★☆☆ ｜ 预计用时：2~3 小时 ｜ 前置：10 课数据集
-> 学完本课你应能回答：**训练循环由哪几块组成？cosine 学习率为什么这样退火？梯度累积在干什么？断点续训怎么做到"从原地继续"？**
-
----
+> [上一课 10-data](../10-data/README.md) ← [目录](../../README.md) → [下一课 12-sft](../12-sft/README.md)
+>
+> 难度：★★★☆☆ ｜ 预计用时 2~3 小时 ｜ 前置：10 课
 
 ## 0. 本课目标
 
-- [ ] 理解训练循环五大件：数据批次 → 前向 → 反向 → 梯度处理 → 优化器步进；
-- [ ] 理解余弦退火学习率（minimind 公式）与它的动机；
-- [ ] 理解梯度裁剪与梯度累积；
-- [ ] 手写 `minimind3/train_utils.py`（get_lr / setup_seed / 保存加载）与 `train_pretrain.py`；
-- [ ] 验收 4 项新检查（11.1~11.4，累计 59 项），其中 11.2/11.3 会**真的训练一个微型模型**。
+- [ ] 理解训练循环五大件：数据批次→前向→反向→梯度处理→步进；
+- [ ] 手写 `train_utils.py`（get_lr/setup_seed/存取）与 `train_pretrain.py`；
+- [ ] 验收 60 项累计（本课新增 11.1~11.4）；11.2/11.3 含真实 CPU 训练。
 
----
+## 1. 理论速览
 
-## 1. 理论：一个训练循环长什么样？
+- **循环骨架**：`loss = model(ids, labels).loss / accum` → `backward()` → 攒够 `accum` 次 → `clip_grad_norm_` + `optimizer.step()` + `zero_grad` → 更新 lr。
+- **cosine 退火**（minimind 公式）：$\text{lr}(t) = \text{lr}_{max}\left(0.1 + 0.45(1+\cos\frac{\pi t}{T})\right)$——首步 1.0×lr、中点 0.55×lr、末步 **0.1×lr**（不归零：尾部保留探索/巩固）。
+- **梯度裁剪**：把全体梯度 L2 范数钳到 grad_clip（防爆炸）；**累积**：小 batch 攒大 batch 的等价替代（除以 accum 保持尺度）。
+- **checkpoint vs 权重**：resume 文件 = model+optimizer+epoch+step（"记忆"）；weights = 纯 state_dict float32（"成果"，供 SFT/转换）+ **sidecar `*.config.json`**（第 13 课关键：`.pth` 不含 rope_theta 等非张量超参）。
+- **可复现**：`setup_seed(seed)` + 每 epoch `setup_seed(seed+epoch)` + `randperm`。
 
-```
-for epoch in range(epochs):
-    for batch in loader:
-        loss = model(ids, labels).loss / accumulation_steps     # 前向
-        loss.backward()                                          # 反向
-        if (step+1) % accumulation_steps == 0:                   # 攒够梯度
-            clip_grad_norm_(params, max_norm)                    # 裁剪
-            optimizer.step(); optimizer.zero_grad()              # 步进
-            lr = get_lr(global_step, total_steps)                # 退火
-```
+## 2. 任务要求（精确规格）
 
-### 1.1 优化器与学习率
+### 2.1 新建 `minimind3/train_utils.py`
 
-- 优化器：**AdamW**（自适应矩估计 + 权重衰减解耦）。LLM 事实标准。minimind 用 `lr=5e-4`、无 weight_decay（小模型）；
-- **学习率**是最敏感的旋钮：太大发散，太小龟速。当代做法是**预热 + 退火**，minimind 用纯余弦退火：
+**模块级**：`import math, os, random`；`import numpy as np`；`import torch`。
 
-$$
-\text{lr}(t) = \text{lr}_{\max} \times \left( 0.1 + 0.45 \times \left(1 + \cos\!\frac{\pi t}{T}\right) \right)
-$$
+| 函数 | 签名 | 返回 | 行为 |
+|---|---|---|---|
+| `setup_seed` | `(seed: int) -> None` | None | `random/np/torch/torch.cuda`（含 manual_seed_all）全部设种子 |
+| `get_lr` | `(current_step: int, total_steps: int, lr: float) -> float` | float | `lr * (0.1 + 0.45*(1+cos(pi*step/total)))` |
+| `Logger` | `(content: str) -> None` | None | `print(content, flush=True)` |
+| `save_checkpoint` | `(path: str, model, optimizer, epoch: int, step: int, extra: dict \| None = None) -> None` | None | 解包 DDP/`_orig_mod` → `{"model": {k: v.float().cpu()…}, "optimizer": optimizer.state_dict(), "epoch":…, "step":…, **extra}` → `torch.save`（目录自动建） |
+| `load_checkpoint` | `(path: str) -> dict` | dict | `torch.load(path, map_location="cpu")` |
+| `save_weights` | `(path: str, model, config=None) -> None` | None | 解包 → `torch.save({k: v.float().cpu()…}, path)`；**若 config 非 None**：写 sidecar `path.replace(".pth", ".config.json")` = `json.dump(config.to_dict(), …, indent=2)` |
 
-首步 = 1.0·lr，中点 = 0.55·lr，末步 = **0.1·lr**。为什么尾巴要压到 0.1 而不归零？
-- 归零会挤掉最后阶段"探索性"的步长，且训练曲线在终点会突然失速；
-- 保留 10% 基线让模型在最后阶段"稳稳巩固"，这是总结经验（minimind 与多家实现一致）。
+### 2.2 新建 `minimind3/train_pretrain.py`
 
-`get_lr` 在 `train_utils.py`，验收 11.1 用三个数值点精确核对（t=1 → lr，t=50% → 0.55lr，t=99% → 0.1lr）。
+**头部**：**先 `import datasets` 再 `import torch`**（Windows DLL 防护）。
 
-### 1.2 梯度裁剪（Gradient Clipping）
+**CLI 参数表（argparse，类型/默认从严）**：
 
-```
-torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)   # 默认 1.0
-```
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `--data_path` | str | `data/tiny_pretrain.jsonl` | 预训练 jsonl |
+| `--save_dir` | str | `out` | 产物目录 |
+| `--save_weight` | str | `pretrain` | 权重名前缀 |
+| `--epochs` | int | 1 | 轮数 |
+| `--batch_size` | int | 8 | 每批样本 |
+| `--learning_rate` | float | 5e-4 | AdamW 初始 lr |
+| `--max_seq_len` | int | 64 | 序列长 |
+| `--hidden_size` | int | 96 | 隐藏维 |
+| `--num_hidden_layers` | int | 2 | 层数 |
+| `--use_moe` | int | 0（choices 0/1） | MoE 开关（教程恒 0） |
+| `--grad_clip` | float | 1.0 | 梯度裁剪范数 |
+| `--accumulation_steps` | int | 1 | 累积步数 |
+| `--log_interval` | int | 10 | 日志间隔 |
+| `--save_interval` | int | 50 | 周期保存权重间隔（0=关） |
+| `--device` | str | cpu | 设备 |
+| `--seed` | int | 42 | 种子 |
+| `--from_weight` | str | `none` | 基础权重名（none=从头） |
+| `--from_resume` | int | 0（choices 0/1） | 断点续训 |
 
-把全体梯度的 L2 范数钳到 `grad_clip` 以内（超了就整体缩放）。防止**梯度爆炸**把参数一步推飞（loss 变 NaN）。
-代价极小、收益极大，训练脚本里是"必装安全带"。
+**模块级函数**：
+- `_weight_path(args) -> str`：`os.path.join(args.save_dir, f"{args.save_weight}_{args.hidden_size}{'_moe' if args.use_moe else ''}.pth")`；
+- `_resume_path(args) -> str`：`_weight_path(args).replace(".pth", "_resume.pth")`；
+- `_batches(indices: list[int], batch_size: int, skip: int = 0)`：切批后 `batches[skip:]`（生成器/列表皆可）；
+- `train_epoch(epoch, loader, iters, args, model, optimizer, start_step=0, lm_config=None) -> list[tuple[int, float]]`：
+  - 局部 `recorded` 收集 `(step, loss)`；
+  - **`step = start_step` 必须先初始化**（resume 空 loader 时尾部判断要用）；
+  - 每步：`lr = get_lr(epoch*iters+step, args.epochs*iters, args.learning_rate)` 写入 `optimizer.param_groups[0]["lr"]` → `loss = model(input_ids, labels=labels).loss` → `(loss/accum).backward()` → `step % accum == 0` 时 clip+step+zero_grad；
+  - 记录 `loss.item() * accum`；`step % log_interval == 0 or step == iters` 时打印 `[epoch {e}/{E}] step {s}/{iters} loss {x:.4f} lr {y:.2e} …`（**验收解析此格式**）；
+  - 周期保存：`args.save_interval > 0 and (step % args.save_interval == 0 or step == iters)` → `save_weights(_weight_path(args), model, config=lm_config)`；
+  - 尾部残梯度：`start_step + 1 <= step and step % accum != 0` → clip+step+zero_grad；
+  - 返回 recorded。
+- `main()`：
+  1. `setup_seed(args.seed)`；`lm_config = MiniMindConfig(hidden_size=…, num_hidden_layers=…, use_moe=bool(…))`；
+  2. 建模型；`from_weight != "none"` 时 `load_state_dict(torch.load(join(save_dir, f"{from_weight}_{hidden_size}.pth")), strict=False)`；
+  3. `PretrainDataset(data_path, max_length=max_seq_len)`；AdamW；
+  4. resume：`_resume_path` 存在时 `load_checkpoint` → `load_state_dict(ckp["model"], strict=False)`（assert 无 missing）→ 恢复 optimizer/epoch/step；
+  5. 每 epoch：`setup_seed(seed+epoch)` + `randperm` + `DataLoader(batch_sampler=_batches(indices, bs, skip=start_step 若首轮))` → `train_epoch(...)` → **epoch 尾无条件 `save_checkpoint(_resume_path(...))`**；
+  6. 结束 `save_weights(_weight_path(args), model, config=lm_config)`（**必带 config sidecar**）。
 
-### 1.3 梯度累积（Gradient Accumulation）
+## 3. 手写步骤
 
-显存不够时，把大 batch 拆成小 batch，**攒**几轮的梯度再 step——数学上等价于大 batch：
+实现 §2.1 → §2.2 → `.venv/Scripts/python.exe verify.py 11`（全量含 CPU 训练约 1 分钟；快查可 `--fast`）。
 
-```
-每小步:        loss = loss / accumulation_steps; loss.backward()   # 不 step
-攒到 N 小步:    optimizer.step(); optimizer.zero_grad()
-```
+## 4. 验收解读（verify/11_pretrain.py）
 
-除 `accumulation_steps` 是为了让平均梯度的尺度与"原版大 batch"一致（否则梯度被放大 N 倍）。
-CPU 小模型也用得上它（比如 8 的 batch × 4 累积 ≈ 32 的等效 batch）。
-
-### 1.4 Checkpoint vs 权重：两样都得存
-
-| 文件 | 内容 | 用途 |
-|---|---|---|
-| `weights_*.pth`（如 `pretrain_96.pth`） | 纯 model.state_dict（float32） | 推理/微调/转换的"成果" |
-| `*_resume.pth` | model + optimizer + epoch + step + seed + … | **断点续训**的"记忆" |
-
-断点续训不是"把权重读回来重新跑"，而是要**无缝接续**：优化器状态（动量/方差）也得带上，
-否则前几轮学习会被"冷启动"破坏。`save_checkpoint` 用 `.tmp` + `os.replace` 原子写入防断电半文件。
-
-### 1.5 可复现性：固定一切随机源
-
-`setup_seed(seed)`：`random` / `numpy` / `torch` / `torch.cuda` 全部固定；数据打乱在每个 epoch
-用 `setup_seed(seed + epoch)` + `randperm` 保持确定性。验收 11.2 正是靠这个"两次训练结果一致"的
-性质才能稳定断言 loss 下降。
-
-### 1.6 本课的两处细节（真实 bug 的教训）
-
-1. **`save_interval=0`**（关闭周期保存）时 `step % 0` 会 ZeroDivisionError——必须写成
-   `args.save_interval > 0 and (step % args.save_interval == 0 or step == iters)`（**短路顺序**）；
-2. **resume 跳完所有 batch** 后，循环外的"残差梯度 flush"会引用未定义的 `step`——先把
-   `step = start_step` 初始化在外。
-
----
-
-## 2. 手写任务清单
-
-1. `train_utils.py`（约 60 行）：
-   - `setup_seed`；`Logger`（带 flush 的 print）；`get_lr`（§1.1 公式）；
-   - `save_checkpoint / load_checkpoint / save_weights`（cast 到 float32、cpu，解包 DDP/compile 名——本课无 DDP，但函数名保持兼容）；
-2. `train_pretrain.py`：完整 CLI 参数（data_path/save_dir/save_weight/epochs/batch_size/learning_rate/max_seq_len/hidden_size/layers/grad_clip/accumulation_steps/log_interval/save_interval/from_resume/seed/...）；
-   - `datasets` 在 `torch` 之前 import（Windows）；
-   - 每 epoch：`setup_seed(seed+epoch)` + `randperm` + `_batches(indices, batch_size, skip=...)`（resume 跳过已处理 batch）；
-   - 循环：forward/backward/累积/step/clip/get_lr；`log_interval` 打印 `loss X lr Y`（验收解析）；
-   - 周期保存权重 + **每 epoch 尾无条件存 resume**；结束再存一份权重（附 config sidecar，13 课用）；
-3. 验收。
-
-```bash
-.venv/Scripts/python.exe verify.py      # 全量：11.2/11.3 真的训练（约 1 分钟）
-```
-
-## 3. 验收解读（verify/11_pretrain.py）
-
-| 检查 | 验什么 |
+| 检查（新） | 验什么 |
 |---|---|
-| 11.1 | get_lr 三点数值（1→lr，中点→0.55lr，末点→0.1lr；单调递减） |
-| 11.2 | **端到端预训练**（子进程）：hidden 96 / 2 层 / seq 64 / batch 8 / 累积 2 / 1 epoch；解析日志断言 **loss 下降**；`pretrain_96.pth` 与 `_resume.pth` 存在；权重可 strict 载入 MiniMindForCausalLM 且 logits 有限 |
-| 11.3 | 断点续训：`--from_resume 1 --epochs 2` 追加训练成功（产出更新权重） |
-| 11.4 | 数据首行 schema = `{"text": ...}` |
+| 11.1 | `get_lr` 三点数值：`get_lr(1)=lr`、中点=0.55lr、末点=0.1lr 且递减 |
+| 11.2 | **端到端预训练子进程**（hidden 96/2 层/seq 64/batch 8/accum 2/epochs 1/seed 0）：解析 `loss` 日志断言下降（宽松阈值 0.95）；`out/pretrain_96.pth` + `_resume.pth` 存在；权重 strict 载入、logits 有限 |
+| 11.3 | 断点续训 `--from_resume 1 --epochs 2` 追加成功 |
+| 11.4 | 数据首行 schema `{"text": …}` |
 
-> 11.2 的宽松阈值（`losses[-1] < losses[0]*0.95`）是有意为之：给不同机器/浮点实现留余量，
-> 但仍能抓住"训练没生效"（loss 不降）的硬伤。
+## 5. 参考答案
 
-## 4. 对照标准实现
+`answers/minimind3/train_utils.py`、`answers/minimind3/train_pretrain.py`（先写后对）。
 
-| minimind3 | minimind 标准实现 |
+## 6. 常见坑
+
+- **`save_interval=0` 的 `%0` 除零**：条件顺序必须 `args.save_interval > 0 and (...)`；
+- **resume 空 loader**：`step` 未初始化 → UnboundLocalError（预初始化成 `start_step`）；
+- **`zero_grad` 频次**：只在真实 step 时清一次（不必每 forward 清）；
+- **`save` 前没 float32/cpu**：半精度直接 `torch.save` 丢精度、13 课 strict 加载报警；
+- **权重保存的 goroutine**：用 `torch.save` 即可；backup 文件用 `.tmp + os.replace` 原子更稳（教程 checkpoint 直接 save）。
+
+## 7. 对照标准实现
+
+| 你手写 | minimind 标准 |
 |---|---|
 | `minimind3/train_utils.py` | `trainer/trainer_utils.py` |
 | `minimind3/train_pretrain.py` | `trainer/train_pretrain.py` |
 
-教程**剪掉**：DDP 多卡 / torch.compile / swanlab-wandb / autocast+scaler（CPU 不需要）/ SkipBatchSampler
-（用 `_batches(skip=...)` 等价实现）。保留核心：get_lr / 累积 / clip / (epoch,step) 级 resume / 权重保存。
-被剪能力全部列入"进阶"。
+教程剪掉 DDP/swanlab/wandb/autocast+scaler/compile（文档列为扩展），核心（get_lr、累积、clip、resume、sidecar）对齐。
 
-## 5. 常见坑
+## 8. 小结
 
-- `% 0` 除零（短路顺序）；resume 空 loader 的 `step` 未初始化；`zero_grad` 放错位置（该在真实 step 前，而非每次 forward 后）；`save` 没解包 `module.`（若套过 DDP）；`torch.save` 前忘了 float32（半精度直接存会丢精度 & 13 课 strict 加载报警）；`os.replace` 才原子（直接 `open(w)` 断电会写坏）。
-
-## 6. 小结 & 下一课
-
-- ✅ 循环五大件：前向/反向/裁剪/步进/退火；
-- ✅ cosine：1.0 → 0.55 → 0.1（尾巴留 10% 防失速）；
-- ✅ 累积 = 显存不足时的大 batch 平替；clip = 防爆炸安全带；
-- ✅ checkpoint 存"记忆"（含优化器），权重存"成果"；
-- ✅ 每 epoch 固定种子 → 验收可复现。
-
-**下一课（12-sft）**：预训练让模型"会说话"，SFT 让模型"会回答"。你会用**同一个循环**但换成 SFT 数据集
-与掩码损失——并亲手验证一个深刻事实：**如果不掩码（连 user 的问题也学），模型会退化成复读机，
-问答质量断崖式下跌**。
+✅ 预训练循环完成：cosine 1.0→0.55→0.1、累积、裁剪、可续训、可复现——并已真的让 loss 下降。
+**下一课**：SFT——换数据、换掩码、降 lr，并亲手证明"不掩码 = 复读机"。

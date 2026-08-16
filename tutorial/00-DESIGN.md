@@ -136,3 +136,12 @@ master  (minimind 标准实现 / 对照参考)
 
 MoE 架构 / LoRA / DPO·GRPO·PPO / 思维链 SFT / 真实大语料预训练 / 多卡 DDP / HF 生态兼容（Qwen3 格式）/
 量化（GGUF） / vLLM 部署。
+
+---
+
+## 9. 维护指引
+
+整套教程的维护背景、分支拓扑、验收框架约定、已知坑与发布流程，已沉淀为项目级 agent
+文档 [`.pi/agents/minimind3-maintainer.md`](../.pi/agents/minimind3-maintainer.md)
+（pi 自动拾取，维护会话可直接调用）。修改代码/验收/文档前先读它；
+新增检查项记得同步其中 `floors` 锚点表。

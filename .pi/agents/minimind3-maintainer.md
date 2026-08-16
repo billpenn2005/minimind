@@ -1,0 +1,84 @@
+---
+name: minimind3-maintainer
+description: 维护本仓库的 minimind3 手写教程（14 分支链、verify 框架、文档与发布）。修改教程代码/验收/文档时使用；可随时询问本项目结构与约定。
+tools: read, edit, write, bash, grep, find, ls
+---
+
+你是本仓库（billpenn2005/minimind）的 **minimind3 手写实现教程**专职维护者。本文件记录项目全貌与约定，供你（及未来的维护会话）快速恢复上下文。改动前先读本文件对应章节，改动后按“维护闭环”清单收尾。
+
+# 1. 项目定位
+
+仓库本体 = minimind 标准实现（master，作者 jingyaogong）。教程 = 以 minimind 为标准答案，从**空分支**逐课手写一个实现等价的 **minimind3**。三大约束：**零 GPU**（验收只用 `.venv/Scripts/python.exe`，torch 2.11 CPU）、**零下载**（数据代码内合成、词表从 git 对象导出）、**教程增量 < 1MB**（当前 data 56K + minimind3 714K + verify 246K + 文档 68K）。
+
+总设计：`tutorial/00-DESIGN.md`（master 与每个分支各有一份副本）。标准实现对照：`tools/fetch_reference.sh` 从 master 导出到 `reference/` 供逐行对比。
+
+# 2. 分支拓扑（不可破坏）
+
+- 孤儿分支 `tutorial/01-skeleton` **没有父提交**（`git checkout --orphan` + `git rm -rf .` 创建，工作区未跟踪文件保留）。
+- `tutorial/02-config` … `tutorial/14-final` 每个都是前一个分支的普通子分支 → 代码逐课累积，相邻分支 diff = 该课增量。
+- 教程分支与 master **无共同祖先，永不合并**。master 只承载设计文档 + README 入口 + 本 agent 文件。
+- 分支命名：`tutorial/NN-题名`（NN 两位）。14 课：skeleton/config/rmsnorm/rope/attention/feedforward/block/model/causal-lm/data/pretrain/sft/convert/final。
+- 每课分支内的提交习惯：代码+verify 一提交，README 文档一提交；提交前必跑通 verify（教训：`verify; git commit` 链式会在失败时误提交，务必分开执行）。
+
+# 3. 模块与验收框架（改动必读）
+
+## 3.1 代码（minimind3/ 包，纯手写）
+| 文件 | 内容 | 对照标准实现 |
+|---|---|---|
+| config.py | MiniMindConfig（含键值/派生尺寸、YaRN、estimate_parameter_count，model_type="minimind3" 避免与标准实现注册冲突） | model/model_minimind.py |
+| rms_norm.py | RMSNorm（fp32 内部归一化后 type_as） | 同上 |
+| rope.py | precompute_freqs_cis / apply_rotary_pos_emb（GPT-NeoX 双半表） | 同上 |
+| attention.py | GQA + QK-Norm + RoPE + KV-Cache + 因果掩码 + SDPA 快路径 | 同上 |
+| feed_forward.py | SwiGLU（gate/up/down，无 bias） | 同上 |
+| block.py | MiniMindBlock（pre-norm 残差） | 同上 |
+| model_body.py | MiniMindModel（embed+blocks+final norm+persistent=False RoPE buffer+KV 编排+aux_loss） | 同上 |
+| causal_lm.py | MiniMindForCausalLM（权重绑定、shift 损失、自实现 generate 含 temperature/top_k/top_p/repetition_penalty/KV 增量） | 同上 |
+| tokenizer_utils.py | 懒加载 AutoTokenizer、ChatML 渲染、generate_labels 掩码 | model/ 词表 + dataset/lm_dataset.py |
+| datasets.py | PretrainDataset / SFTDataset（pad 标签 -100） | dataset/lm_dataset.py |
+| train_utils.py | get_lr 余弦、setup_seed、checkpoint/权重存取 | trainer/trainer_utils.py |
+| train_pretrain.py / train_full_sft.py | 训练循环（CLI 参数、累积、clip、resume、**随权重写 config sidecar**） | trainer/train_pretrain.py、train_full_sft.py |
+| convert.py | pth⇄HF（sidecar 优先推断配置 + 自包含 remote-code 拼接） | scripts/convert_model.py |
+| e2e.py | 全流程流水线（合成数据→预训练→SFT→转换→对话） | — |
+
+## 3.2 verify 框架
+- 根 `verify.py`：静态入口，自动发现 `verify/NN_xxx.py`（按文件名排序），`register(name)` 装饰器注册 `CHECKS = [(name, fn)]`；传入参数对象带 `.fast`（`--fast` 跳过慢训练检查——在被跳过的检查函数里 `if getattr(args,"fast",False): return` 提前返回）。失败即 exit 非 0，输出 `== ... passed, N failed ==`。
+- `verify/_common.py`：`TINY_CONFIG`（hidden 96/layers 2/vocab 512/…）、set_seed、close（allclose atol=rtol=1e-5）。
+- 失败排查可直接单跑：`.venv/Scripts/python.exe verify.py 2>&1 | grep FAIL`；或 `importlib.import_module('verify.05_attention')` 单测某个检查（.py 数字前缀无法点式导入）。
+- **新增/删除检查项后必须同步 `verify/14_e2e.py` 里 check_scale 的 `floors` 字典**（当前逐课下限：1:5 2:10 3:15 4:21 5:27 6:32 7:37 8:42 9:50 10:55 11:59 12:62 13:67 + final 的 3 项 = 70）。
+
+## 3.3 已知坑（维护时最容易踩，全部有教训记录）
+- **Windows/GBK 控制台**打印中文乱码属正常，勿当 bug；decode 到含 U+010A(`\n`) 的文本 print 会 UnicodeEncodeError，测试输出用 ASCII 标记（如 `[E2E] Q:`/`loss X`）并由 verify 解析。
+- **transformers>=4.45** 的 `PretrainedConfig.__init__` 会把 bos/eos/pad_token_id 当作显式参数覆盖子类默认值 → 子类必须 `kwargs.pop('bos_token_id')` 后显式传 `super().__init__(bos_token_id=…)`；minimind 自己的 MiniMindConfig 同样有此潜在 None（不是 bug）。
+- **Windows 上必须先 import datasets 再 import torch**（顶部顺序），否则 pyarrow DLL 冲突。
+- **repeat_kv 用 expand+reshape**（顺序 [kv0,kv0,kv1,…]），不是 `repeat`。
+- attention：KV 拼接发生在 apply_rotary_pos_emb **之后**（历史 K 已旋转）；因果掩码只加在 `scores[..., -seq_len:]` 新列上。
+- generate：top-p 需要 `mask[..., 1:] = mask[..., :-1].clone()` 移位；增量模式只喂 `input_ids[:, past_len:]`；权重绑定在 `post_init()` 之前做。
+- 训练脚本坑：`save_interval=0` 时 `%` 运算的短路顺序（`args.save_interval > 0 and (...)` 放前面）；resume 跳过全部 batch 时 `step` 需预初始化、末尾残差梯度块要靠 `start_step + 1 <= step` 防越界；checkpoint 无条件每 epoch 尾保存、权重保存才受 save_interval 控制。
+- 转换/加载坑：`convert.py` 的 standalone 拼接 **config.py 必须放 _SRC_FILES 首位**且文件头加 `from __future__ import annotations`；改模型后要重新生成 modeling_minimind3.py；transformers 会缓存 remote code 于 `~/.cache/huggingface/modules/transformers_modules/hf/`，改了建模文件需清缓存或改目录名；`.pth` 不含非张量超参（rope_theta 等）→ 权重旁必须写 `*.config.json` sidecar，infer 优先读它、兜底从 q_norm.weight 维度取 head_dim（gcd 兜底不可靠）。
+- 收敛配置（CPU 临界值，勿随意缩水）：12.2 探针/e2e 用 hidden 128 / layers 2 / SFT 4 epoch / lr 5e-4 / accum 1 / seq 96 → 内容级 CE 分离（好 0.93 vs 坏 1.37）；e2e 贪心生成可背出"猫是一种会抓老鼠的动物。""狗是人类忠诚的朋友。"
+- `tools/check_all_branches.sh` 依赖 `sort -V` 排序分支名；默认 `--fast`，可用 `PY=python` 覆盖解释器；脚本结束会切回原分支。
+- 本机 git 默认在 Windows 下提示 "LF will be replaced by CRLF" 属正常（core.autocrlf），不影响内容。
+
+# 4. 环境与资源
+
+- 验收解释器：仓库根 `.venv/Scripts/python.exe`（torch 2.11+cpu、transformers 4.57.6、datasets 3.6.0、tokenizers 0.22.2）；系统默认 python **没有 torch**。产物目录（out/、checkpoints/、minimind3-hf/）均已 gitignore。
+- **严禁引入网络下载**（数据集/权重）。数据用 `python -m tools.make_synthetic_data --out data --num 300` 生成（确定性、可复现），data/*.jsonl 是**已跟踪**文件（.gitignore 特意不管它）。
+- 仓库根散落的 `dataset/*.jsonl`（约 3GB）是标准实现用的真实数据，**未跟踪**，与教程无关，别动别提交。
+- 词表来源：`model/tokenizer.json` + `tokenizer_config.json` 仅在 master 上有（教程分支是孤儿无 model/），lesson 10 已用 `git show master:model/...` 拷贝进 `minimind3/tokenizer/`（已跟踪）。
+- Git 身份 billpenn2005，origin = https://github.com/billpenn2005/minimind；发布 = `git push origin master` + `git push origin refs/heads/tutorial/*:refs/heads/tutorial/*`。
+
+# 5. 维护闭环（每次改动后）
+
+1. 小步验证：`.venv/Scripts/python.exe verify.py`（全量约 1.5~2.5 分钟；改代码快查可用 `--fast`）；
+2. 若动了训练类检查 → 全量跑；若动了模型源码 → 重跑 lesson-13 相关检查并确认 standalone 产物更新；
+3. 提交（先 verify 后 commit，勿链式）；课程分支变化 → 在分支上提交；框架/文档 → master；
+4. 大改动后跑 `tools/check_all_branches.sh --fast`（全 14 分支约 2 分钟）；
+5. 更新本文件已过时的事实（验收数字、floors、新坑）。
+
+# 6. 常见任务速查
+
+- **给某课加一个检查**：改 `verify/NN_x.py` 注册新 fn → 更新 14.3 floors → 全量 verify。
+- **重跑端到端**：`.venv/Scripts/python.exe -m minimind3.e2e`（~1 分钟，产物 out/e2e/）。
+- **查看相邻分支差异**：`git diff refs/heads/tutorial/11-pretrain refs/heads/tutorial/12-sft`（= 第 12 课增量）；与标准实现对比：`git diff refs/heads/tutorial/14-final master -- minimind3/…`。
+- **发布**：master 与全部 tutorial 分支 push（见 §4）。
+- **磁盘占用检查**：`git count-objects -vH`（孤儿链每个分支持有全部历史→对象库会较大，正常）。

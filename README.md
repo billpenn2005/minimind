@@ -3,7 +3,7 @@
 > 🎯 **一句话**：像搭乐高一样，从**零**手写一个能"对话"的小型语言模型 **minimind3**。
 > 不需要 GPU、不需要下载任何数据集、不需要任何深度学习基础——只需要 Python 和好奇心。
 
-[tutorial/00-DESIGN.md](tutorial/00-DESIGN.md)（总设计）｜本页是入门手册：**我是谁、适合谁、怎么学、会遇到什么**。
+[AGENTS.md](AGENTS.md)（总设计）｜本页是入门手册：**我是谁、适合谁、怎么学、会遇到什么**。
 
 ---
 
@@ -125,7 +125,7 @@ verify.py                验收入口（判卷机）
 minimind3/               你的手写实现（模型/数据/训练/转换/端到端）
 verify/                  验收检查（每课一个 NN_xxx.py）
 tools/                   工具（合成数据、参考实现导出、全链验收脚本）
-tutorial/                文档（00-DESIGN 总设计 + 14 课 README）
+tutorial/                文档（AGENTS.md 总设计 + 14 课 README）
 data/                    合成数据（jsonl，可复现）
 checkpoints/ out/  ...   训练产物（自动生成，已 gitignore）
 ```

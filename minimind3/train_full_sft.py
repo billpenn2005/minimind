@@ -27,7 +27,7 @@ from .train_pretrain import _batches, _weight_path  # 复用切批/路径逻辑
 from .train_utils import Logger, get_lr, save_checkpoint, save_weights, setup_seed
 
 
-def train_epoch(epoch, loader, iters, args, model, optimizer, start_step=0):
+def train_epoch(epoch, loader, iters, args, model, optimizer, start_step=0, lm_config=None):
     model.train()
     start_time = time.time()
     recorded = []
@@ -57,7 +57,7 @@ def train_epoch(epoch, loader, iters, args, model, optimizer, start_step=0):
             Logger(f"[epoch {epoch + 1}/{args.epochs}] step {step}/{iters} loss {cur_loss:.4f} lr {lr:.2e} eta {eta:.1f}min")
 
         if args.save_interval > 0 and (step % args.save_interval == 0 or step == iters):
-            save_weights(_weight_path(args), model)
+            save_weights(_weight_path(args), model, config=lm_config)
             Logger(f"  weights saved -> {_weight_path(args)}")
 
         del input_ids, labels
@@ -114,10 +114,10 @@ def main():
         setup_seed(args.seed + epoch)
         indices = torch.randperm(len(train_ds)).tolist()
         loader = DataLoader(train_ds, batch_sampler=_batches(indices, args.batch_size))
-        records = train_epoch(epoch, loader, len(loader), args, model, optimizer)
+        records = train_epoch(epoch, loader, len(loader), args, model, optimizer, lm_config=lm_config)
         save_checkpoint(_weight_path(args).replace(".pth", "_resume.pth"), model, optimizer, epoch + 1, records[-1][0] if records else 0)
 
-    save_weights(_weight_path(args), model)
+    save_weights(_weight_path(args), model, config=lm_config)
     Logger("done.")
 
 

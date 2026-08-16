@@ -29,7 +29,7 @@ from .datasets import PretrainDataset
 from .train_utils import Logger, get_lr, load_checkpoint, save_checkpoint, save_weights, setup_seed
 
 
-def train_epoch(epoch, loader, iters, args, model, optimizer, start_step=0):
+def train_epoch(epoch, loader, iters, args, model, optimizer, start_step=0, lm_config=None):
     model.train()
     start_time = time.time()
     recorded = []  # (step, loss) 供验收脚本解析
@@ -61,7 +61,7 @@ def train_epoch(epoch, loader, iters, args, model, optimizer, start_step=0):
             )
 
         if args.save_interval > 0 and (step % args.save_interval == 0 or step == iters):
-            save_weights(_weight_path(args), model)
+            save_weights(_weight_path(args), model, config=lm_config)
             Logger(f"  weights saved -> {_weight_path(args)}")
 
         del input_ids, labels
@@ -141,13 +141,13 @@ def main():
         indices = torch.randperm(len(train_ds)).tolist()
         loader = DataLoader(train_ds, batch_sampler=_batches(indices, args.batch_size, skip=start_step if epoch == start_epoch else 0))
         iters = len(loader) + (start_step if epoch == start_epoch else 0)
-        records = train_epoch(epoch, loader, iters, args, model, optimizer, start_step=start_step if epoch == start_epoch else 0)
+        records = train_epoch(epoch, loader, iters, args, model, optimizer, start_step=start_step if epoch == start_epoch else 0, lm_config=lm_config)
         start_step = 0  # 仅首个恢复轮次带偏移
         # 每个 epoch 结束必存 resume 检查点（与 save_interval 无关，保证可续训）
         save_checkpoint(_resume_path(args), model, optimizer, epoch + 1, records[-1][0] if records else 0)
 
-    # 最后再存一份权重，保证"跑完即有产出"
-    save_weights(_weight_path(args), model)
+    # 最后再存一份权重，保证"跑完即有产出"（附 config sidecar）
+    save_weights(_weight_path(args), model, config=lm_config)
     Logger("done.")
 
 

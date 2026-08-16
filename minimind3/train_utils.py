@@ -45,9 +45,19 @@ def load_checkpoint(path: str) -> dict:
     return torch.load(path, map_location="cpu")
 
 
-def save_weights(path: str, model) -> None:
-    """保存纯权重（用于下游 SFT / 转换）：name -> tensor。"""
+def save_weights(path: str, model, config=None) -> None:
+    """保存纯权重（用于下游 SFT / 转换）：name -> tensor。
+
+    若给定 config，同时写一份 sidecar `*.config.json`：权重不自描述尺寸类
+    超参（rope_theta/max_position_embeddings 等），sidecar 保证转换时可还原。
+    """
     raw = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
     raw = getattr(raw, "_orig_mod", raw)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     torch.save({k: v.float().cpu() for k, v in raw.state_dict().items()}, path)
+    if config is not None:
+        import json
+
+        sidecar = path.replace(".pth", ".config.json")
+        with open(sidecar, "w", encoding="utf-8") as f:
+            json.dump(config.to_dict(), f, ensure_ascii=False, indent=2)

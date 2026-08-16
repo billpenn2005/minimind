@@ -30,7 +30,7 @@ def check_skeleton(args):
         "verify.py",
         "verify/_common.py",
         "verify/01_skeleton.py",
-        "tutorial/00-DESIGN.md",
+        "AGENTS.md",
         "tutorial/01-skeleton/README.md",
     ]:
         assert (REPO_ROOT / rel).exists(), f"缺少文件: {rel}"

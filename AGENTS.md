@@ -1,10 +1,8 @@
----
-name: minimind3-maintainer
-description: 维护本仓库的 minimind3 手写教程（14 分支链、verify 框架、文档与发布）。修改教程代码/验收/文档时使用；可随时询问本项目结构与约定。
-tools: read, edit, write, bash, grep, find, ls
----
+# minimind3 教程 · 维护手册（AGENTS.md）
 
-你是本仓库（billpenn2005/minimind）的 **minimind3 手写实现教程**专职维护者。本文件记录项目全貌与约定，供你（及未来的维护会话）快速恢复上下文。改动前先读本文件对应章节，改动后按“维护闭环”清单收尾。
+> 本文件为仓库根 `AGENTS.md`：pi 启动时自动加载并拼入上下文（见 pi 文档 Context Files）。
+> 记录 minimind3 手写教程的全貌与约定，供后续维护/修改会话迅速恢复上下文；
+> 因内容会注入每个会话，请保持精炼。改动前先读对应章节，改动后按第 5 节「维护闭环」清单收尾。
 
 # 1. 项目定位
 

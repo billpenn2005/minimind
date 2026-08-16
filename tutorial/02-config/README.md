@@ -63,5 +63,9 @@ JSON round-trip、参数估算公式、YaRN 开关。
 
 - `super().__init__(**kwargs)` 必须放在全部属性赋值之后，且把未知 kwargs 传下去，
   否则 `from_pretrained` 会报未知字段错误；
+- **transformers(>=4.45 系列) 的 `PretrainedConfig.__init__` 把 `bos_token_id/`
+  `eos_token_id/pad_token_id` 等作为显式命名参数（默认 None），若不显式传递，
+  会被覆盖为 None**——这正是本课 verify 02.1 抓到的坑（标准实现 minimind 中
+  `MiniMindConfig().bos_token_id` 同样为 None，教程里我们做对：显式传递给 super）；
 - 派生参数要**在赋值时计算**，不要先存再算，避免多构造路径不一致；
 - 别忘 `num_key_value_heads` 默认是 4（GQA），不是 8。

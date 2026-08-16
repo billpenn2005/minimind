@@ -71,7 +71,13 @@ class MiniMindConfig(PretrainedConfig):
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
 
-        super().__init__(**kwargs)
+        # 注意：transformers 新版本将 bos/eos 等 token id 作为 PretrainedConfig.__init__
+        # 的显式命名参数处理（默认 None），必须显式传递，否则会被覆盖为 None。
+        super().__init__(
+            bos_token_id=self.bos_token_id,
+            eos_token_id=self.eos_token_id,
+            **kwargs,
+        )
 
     # ---------------------------------------------------------------- 参数估算
     def estimate_parameter_count(self) -> int:

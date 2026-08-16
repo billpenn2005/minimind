@@ -7,7 +7,7 @@
 
 # 1. 项目定位与约束
 
-仓库本体 = minimind 标准实现（master，作者 jingyaogong）。教程 = 以 minimind 为标准答案，从**空分支**逐课手写一个实现等价的 **minimind3**。三大约束：**零 GPU**（验收只用 `.venv/Scripts/python.exe`，torch 2.11 CPU）、**零下载**（数据代码内合成、词表从 git 对象导出）、**教程增量 < 1MB**（当前 data 56K + minimind3 ~714K + verify ~246K + 文档 ~110K）。
+仓库本体 = minimind 标准实现（master，作者 jingyaogong）。教程 = 以 minimind 为标准答案，从**空白的 `minimind3/` 工作区**逐课手写一个实现等价的 **minimind3**。三大约束：**零 GPU**（验收只用 `.venv/Scripts/python.exe`，torch 2.11 CPU）、**零下载**（数据代码内合成、词表从 git 对象导出）、**教程增量 < 1MB**（当前 answers ~770K + verify ~250K + 文档 ~130K）。
 
 总设计 = 本文件。标准实现对照：`tools/fetch_reference.sh` 从 master 导出到 `reference/` 供逐行对比。
 
@@ -25,23 +25,18 @@
 - **预写答案会让人不看代码就抄吗**：答案与 verify 同仓，是"脚手架 + 评分标准"；文档要求先自己写再对照。
 - **估算时长**：模型核心每课 1~2h，训练与转换 2~3h，总约 25~35h。
 
-# 2. 学习路径与分支拓扑（不可破坏）
+# 2. 学习路径与分支拓扑（2026-08 改版：单分支）
 
-- 孤儿分支 `tutorial/01-skeleton` **没有父提交**（`git checkout --orphan` + `git rm -rf .` 创建，工作区未跟踪文件保留）。
-- `tutorial/02-config` … `tutorial/14-final` 每个都是前一个分支的普通子分支 → 代码逐课累积，相邻分支 diff = 该课增量。
-- 教程分支与 master **无共同祖先，永不合并**。master 只承载本文件 + README 入口。
-- 分支命名：`tutorial/NN-题名`（NN 两位）。14 课：skeleton/config/rmsnorm/rope/attention/feedforward/block/model/causal-lm/data/pretrain/sft/convert/final。
-- 每分支的根文档（README.md、AGENTS.md）是**从 master 拷来的快照**（教程分支是孤儿，看不见 master 文件——与 lesson 10 的 tokenizer 拷贝同模式）；改动时每分支需单独同步。
+- **现行教程 = 单一分支 `tutorial-main`**（基于旧链末支 14-final 派生）：所有学习/验收在同一条时间线上，`git log` 即学习进程。
+- 旧 14 分支链 `tutorial/01-skeleton`（孤儿）…`tutorial/14-final` 在远端保留为**历史归档**，不再用于教学。
+- 结构要点：完整实现与规范数据在 `answers/`（参考答案，先写后对）；工作区 `minimind3/` 从零创建、`data/` 第 10 课起生成；按课留白由 `verify/01_skeleton.py` 的 01.x 强制执行（minimind3/ 只允许 ≤ 当前课的产物文件）。
+- master 只承载本文件 + README 入口 + minimind 标准实现。
 
-## 2.1 分支图（含每分支累积验收数锚点）
+## 2.1 章节导航（14 课，验收锚点按课累积）
 
-```
-01-skeleton (5) → 02-config (10) → 03-rmsnorm (15) → 04-rope (21) → 05-attention (27)
-→ 06-feedforward (32) → 07-block (37) → 08-model (42) → 09-causal-lm (50) → 10-data (55)
-→ 11-pretrain (59) → 12-sft (62) → 13-convert (67) → 14-final (70)
-```
+01:6 → 02:11 → 03:16 → 04:22 → 05:28 → 06:33 → 07:38 → 08:43 → 09:51 → 10:56 → 11:60 → 12:63 → 13:68 → 14:71
 
-（锚点即 verify/14_e2e.py `floors` 字典；新增/删除检查必须同步。）
+验收 = `verify.py NN`（只跑 ≤ NN 课）/ `verify.py`（全部）；锚点在 `verify/14_e2e.py` 14.3（总量 ≥70）与根 README 章节表；新增/删除检查必须同步两处。
 
 # 3. 验收机制（改动必读）
 
@@ -49,7 +44,7 @@
 - `verify/_common.py`：`TINY_CONFIG`（hidden 96/layers 2/vocab 512/…）、`set_seed`、`close`（allclose atol=rtol=1e-5）。
 - 验收哲学：检查是"行为指纹"而非实现绑定——RoPE 保范、KV 增量==全量、清参恒等（残差）、CE gap（学到没）、1e-5 round-trip（转换无损）。训练检查用微型配置（hidden 96~128、2 层、seq 64~96）CPU 秒级到分钟级完成。
 - 失败排查：`.venv/Scripts/python.exe verify.py 2>&1 | grep FAIL`；或 `importlib.import_module('verify.05_attention')` 单测（数字前缀无法点式导入）。
-- 全链验收：`bash tools/check_all_branches.sh --fast`（14 分支依次 checkout 跑 verify，约 2 分钟；`--full` 约 10 分钟；`PY=` 可换解释器）。
+- 全量验收 = `verify.py`（约 2~4 分钟含 e2e）；单课 = `verify.py NN`；QA 用"答案回拷法"（临时 `cp -r answers/minimind3 minimind3/` 跑全量后删除），见 §7 闭环。
 
 # 4. 模块实现要点（minimind3/ 包，纯手写）
 
@@ -80,7 +75,7 @@
 - generate：top-p 需要 `mask[..., 1:] = mask[..., :-1].clone()` 移位；增量模式只喂 `input_ids[:, past_len:]`；权重绑定在 `post_init()` 之前做。
 - 训练脚本坑：`save_interval=0` 时 `%` 运算的短路顺序（`args.save_interval > 0 and (...)` 放前面）；resume 跳过全部 batch 时 `step` 需预初始化、末尾残差梯度块要靠 `start_step + 1 <= step` 防越界；checkpoint 无条件每 epoch 尾保存、权重保存才受 save_interval 控制。
 - 转换/加载坑：`convert.py` 的 standalone 拼接 **config.py 必须放 _SRC_FILES 首位**且文件头加 `from __future__ import annotations`；改模型后要重新生成 modeling_minimind3.py；transformers 会缓存 remote code 于 `~/.cache/huggingface/modules/transformers_modules/hf/`，改了建模文件需清缓存或改目录名；`.pth` 不含非张量超参（rope_theta 等）→ 权重旁必须写 `*.config.json` sidecar，infer 优先读它、兜底从 q_norm.weight 维度取 head_dim（gcd 兜底不可靠）。
-- 文档快照坑：教程分支各自持有 AGENTS.md/README 快照，改了 master 的根文档**不会自动**进分支；每分支需单独同步（见 §8 闭环第 5 步）。
+- 答案同步坑：`answers/minimind3/` 是工作区实现的规范抄本，改动实现必须同步 answers（或反之）；旧分支链已归档，勿再改动。
 - `tools/check_all_branches.sh` 依赖 `sort -V` 排序分支名；默认 `--fast`，可用 `PY=python` 覆盖解释器；脚本结束会切回原分支。
 - 本机 git 默认在 Windows 下提示 "LF will be replaced by CRLF" 属正常（core.autocrlf），不影响内容。
 

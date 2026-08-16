@@ -39,6 +39,8 @@ def check_lr(args):
 
 @register("11.2 合成数据上端到端预训练（loss 下降 + 产出权重）")
 def check_train(args):
+    if getattr(args, "fast", False):
+        return
     with tempfile.TemporaryDirectory() as td:
         save_dir = Path(td) / "out"
         data_path = REPO_ROOT / "data" / "tiny_pretrain.jsonl"
@@ -82,6 +84,8 @@ def check_train(args):
 
 @register("11.3 resume 续训：步数从断点继续")
 def check_resume(args):
+    if getattr(args, "fast", False):
+        return
     from minimind3.train_utils import get_lr
 
     with tempfile.TemporaryDirectory() as td:

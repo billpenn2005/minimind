@@ -20,8 +20,10 @@
   $$\hat{x} = \frac{x}{\sqrt{\frac{1}{d}\sum x_i^2 + \epsilon}} \cdot \gamma$$
   只算均方根，**没有均值中心化**，省一次归约；实验表明对 Transformer 足够。
 
-**齐次性**：RMSNorm 是齐次函数（$\mathrm{RMSNorm}(c x) = c\,\mathrm{RMSNorm}(x)$），
-LayerNorm 不是（因为减了均值）。verify 03.2 专门抓这个数学性质。
+**尺度不变、非中心化**：RMSNorm 会把输入的整体缩放“归化”掉：
+$\mathrm{RMSNorm}(c x) = \mathrm{RMSNorm}(x)$（尺度不变）；并且它**不做均值中心化**：
+输出沿特征维的均值一般不为 0（LayerNorm 输出均值为 0）。
+verify 03.2 专门抓这两个数学性质，任何“顺手减去均值”的实现都会失败。
 
 ### 3. 实现要点
 
@@ -43,7 +45,7 @@ LayerNorm 不是（因为减了均值）。verify 03.2 专门抓这个数学性�
 .venv/Scripts/python.exe verify.py
 ```
 
-检查点：形状/初值/数值、齐次性、fp32 内部精度、梯度回传、防除零。
+检查点：形状/初值/数值、尺度不变与非中心化、fp32 内部精度、梯度回传、防除零。
 验收通过后，本课的 RMSNorm 将成为注意力 QK-Norm 与最终层归一化的公共件。
 
 ## 对照标准实现

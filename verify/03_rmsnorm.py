@@ -42,18 +42,22 @@ def check_basic(args):
     assert torch.allclose(y, ref2, atol=1e-6)
 
 
-@register("03.2 齐次性（不做均值中心化）")
-def check_homogeneity(args):
-    """RMSNorm 是齐次的：rmsnorm(c·x) = c·rmsnorm(x)（LayerNorm 不具备）。"""
+@register("03.2 尺度不变性与非中心化（区别于 LayerNorm）")
+def check_properties(args):
+    """两个区分 RMSNorm 与 LayerNorm 的数学性质：
+    1. 尺度不变：rmsnorm(c·x) == rmsnorm(x)（缩放被归化吸收）；
+    2. 非中心化：输出沿特征维的均值一般不为 0（LayerNorm 输出均值为 0）。
+    """
     from minimind3.rms_norm import RMSNorm
 
     set_seed(1)
-    rms = RMSNorm(dim=16, eps=1e-6)
-    x = torch.randn(2, 8, 16)
+    rms = RMSNorm(dim=4, eps=1e-6)  # dim 小，让“非中心化”特征显著
+    x = torch.randn(2, 8, 4)
     c = 3.7
-    y1 = rms(x)
-    y2 = rms(x * c)
-    assert torch.allclose(y2 / c, y1, atol=1e-5), "齐次性被破坏——说明实现里去均值了"
+    y = rms(x)
+    assert torch.allclose(rms(x * c), y, atol=1e-5), "尺度不变性被破坏，说明实现里做了均值中心化"
+    # 若实现偷偷减了均值（LayerNorm），输出均值会接近 0 -> 此断言失败
+    assert y.mean(-1).abs().max().item() > 0.1, "输出均值接近 0，疑似做了均值中心化（LayerNorm 行为）"
 
 
 @register("03.3 内部 fp32 计算")

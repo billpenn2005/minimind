@@ -94,7 +94,7 @@ verify.py                    ← 验收入口（"判卷机"）
 minimind3/                   ← 你的手写实现（从空壳 __init__.py 开始，逐课填满）
 verify/                      ← 验收检查（每课新增一个 NN_xxx.py）
 tools/                       ← 工具（make_synthetic_data.py 生成数据、fetch_reference.sh 导出参考实现）
-tutorial/                    ← 文档（00-DESIGN 总设计 + 每课 NN-xxx/README.md）
+tutorial/                    ← 文档（AGENTS.md 总设计 + 每课 NN-xxx/README.md）
 data/                        ← 合成数据（本课先由工具生成，第 10 课开始被数据集类使用）
 ```
 

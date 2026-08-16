@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+.vscode/
+out/
+checkpoints/
+minimind3-hf/
+*.pth
+*.safetensors
+dataset/*.jsonl

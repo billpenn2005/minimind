@@ -35,7 +35,7 @@
 
 > 📚 **手写实现教程**：基于本仓库（标准实现）从空分支逐课构建 **minimind3** ——
 > 模型源码 / 预训练 / 全参 SFT / HF transformers 转换 / 端到端测试，全程 CPU 可跑、数据代码内合成、
-> 每课配程序化验收（`verify.py`）。总设计见 [`tutorial/00-DESIGN.md`](./tutorial/00-DESIGN.md)，
+> 每课配程序化验收（`verify.py`）。总设计/维护手册见 [`AGENTS.md`](AGENTS.md)，
 > 分支链 `tutorial/01-skeleton` → `tutorial/14-final`，可 `tools/fetch_reference.sh` 对照标准实现。
 
 </div>
